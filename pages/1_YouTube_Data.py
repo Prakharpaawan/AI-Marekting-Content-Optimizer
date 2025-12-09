@@ -1,59 +1,87 @@
-"""
-youtube_data.py
-Fetch video metadata (as before) AND fetch up to N comments per video.
-Writes two tabs:
- - "YouTube Data"       (video-level summary)
- - "YouTube Comments"   (comment-level rows for sentiment)
-"""
-
+import streamlit as st
 import os
 from collections import Counter
 from datetime import datetime, timedelta
 import re
 import time
-
-import gspread
 import pandas as pd
-from dotenv import load_dotenv
-from googleapiclient.discovery import build
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from googleapiclient.discovery import build
 
-load_dotenv("secrettt.env")
+# ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
+def get_secret(key_name):
+    """Fetch secret from Streamlit Cloud OR Local .env file"""
+    # 1. Try Streamlit Secrets (Cloud)
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
+    
+    # 2. Try Local .env (Laptop)
+    try:
+        from dotenv import load_dotenv
+        load_dotenv("secrettt.env")
+        return os.getenv(key_name)
+    except ImportError:
+        return None
+
+def connect_sheets():
+    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
+    # A. Try Cloud Secrets (Streamlit)
+    if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    
+    # B. Try Local File (Laptop)
+    elif os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    
+    else:
+        st.error("❌ Critical Error: No Google Credentials found! Check Streamlit Secrets or credentials.json.")
+        st.stop()
+        
+    client = gspread.authorize(creds)
+    return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")  # replace if needed
+# Get Key safely using the helper function
+YOUTUBE_API_KEY = get_secret("YOUTUBE_API_KEY")
+
 GOOGLE_SHEET_NAME = "Content Performance Tracker"
 VIDEOS_TAB = "YouTube Data"
 COMMENTS_TAB = "YouTube Comments"
-CREDENTIALS_FILE = "credentials.json"
 
 TOPICS = ["digital marketing", "content marketing", "social media strategy", "Video content strategy"]
 PUBLISHED_DAYS = 30
 MAX_VIDEOS_PER_TOPIC = 30
 MIN_VIEWS = 10000
-MAX_COMMENTS_PER_VIDEO = 50  # how many comments to fetch per video (top-level)
+MAX_COMMENTS_PER_VIDEO = 50 
 
 # ----- HELPERS -----
-def connect_sheets():
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-    return gspread.authorize(creds).open(GOOGLE_SHEET_NAME)
-
 def clean_text(text):
     if not isinstance(text, str):
         return ""
     return re.sub(r"\s+", " ", text).strip()
 
-# ----- YOUTUBE CLIENT -----
-youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-
 def collect_videos_and_comments():
+    if not YOUTUBE_API_KEY:
+        st.error("❌ YouTube API Key missing!")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Initialize YouTube Client inside the function to avoid global errors
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+
     published_after = (datetime.utcnow() - timedelta(days=PUBLISHED_DAYS)).isoformat("T") + "Z"
     all_videos = []
     all_comments = []
 
-    for topic in TOPICS:
-        print(f"Searching videos for topic: {topic}")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for idx, topic in enumerate(TOPICS):
+        status_text.write(f"🔎 Searching videos for topic: **{topic}**...")
+        
         try:
             search_resp = youtube.search().list(
                 q=topic,
@@ -64,19 +92,24 @@ def collect_videos_and_comments():
                 publishedAfter=published_after
             ).execute()
         except Exception as e:
-            print("YouTube search error:", e)
+            st.warning(f"YouTube search error for {topic}: {e}")
             continue
 
-        for item in search_resp.get("items", []):
+        items = search_resp.get("items", [])
+        
+        for item in items:
             video_id = item["id"]["videoId"]
+            
             # fetch full video snippet + stats
             try:
                 v_resp = youtube.videos().list(part="statistics,snippet", id=video_id).execute()
             except Exception as e:
                 print("Video fetch error:", e)
                 continue
+            
             if not v_resp.get("items"):
                 continue
+            
             video = v_resp["items"][0]
             stats = video.get("statistics", {})
             snippet = video.get("snippet", {})
@@ -118,7 +151,7 @@ def collect_videos_and_comments():
                         videoId=video_id,
                         maxResults=min(MAX_COMMENTS_PER_VIDEO, 100),
                         textFormat="plainText",
-                        order="relevance"  # relevance tends to pull meaningful comments
+                        order="relevance"
                     )
                     c_resp = c_request.execute()
                     count = 0
@@ -138,9 +171,9 @@ def collect_videos_and_comments():
                             count += 1
                             if count >= MAX_COMMENTS_PER_VIDEO:
                                 break
-                        # paginate
+                        
                         if "nextPageToken" in c_resp and count < MAX_COMMENTS_PER_VIDEO:
-                            time.sleep(0.5)
+                            time.sleep(0.2) # slightly faster sleep for UI
                             c_resp = youtube.commentThreads().list(
                                 part="snippet",
                                 videoId=video_id,
@@ -153,16 +186,22 @@ def collect_videos_and_comments():
                             break
                 except Exception as e:
                     print(f"Could not fetch comments for {video_id}: {e}")
+        
+        # Update progress bar
+        progress_bar.progress((idx + 1) / len(TOPICS))
 
+    status_text.success("✅ Data Collection Complete!")
     return pd.DataFrame(all_videos), pd.DataFrame(all_comments)
 
 def upload_to_sheets(videos_df, comments_df):
     sheet = connect_sheets()
+    
     # Videos
     try:
         wv = sheet.worksheet(VIDEOS_TAB)
     except gspread.exceptions.WorksheetNotFound:
         wv = sheet.add_worksheet(title=VIDEOS_TAB, rows="2000", cols="20")
+    
     v_data = [videos_df.columns.tolist()] + videos_df.values.tolist() if not videos_df.empty else []
     if v_data:
         wv.clear()
@@ -173,15 +212,35 @@ def upload_to_sheets(videos_df, comments_df):
         wc = sheet.worksheet(COMMENTS_TAB)
     except gspread.exceptions.WorksheetNotFound:
         wc = sheet.add_worksheet(title=COMMENTS_TAB, rows="5000", cols="30")
+    
     c_data = [comments_df.columns.tolist()] + comments_df.values.tolist() if not comments_df.empty else []
     if c_data:
         wc.clear()
         wc.update(values=c_data, range_name="A1")
 
-    print("YouTube Data and YouTube Comments updated successfully.")
+    st.toast("Updated Google Sheets successfully!", icon="🚀")
 
-if __name__ == "__main__":
-    videos_df, comments_df = collect_videos_and_comments()
-    if not videos_df.empty:
-        videos_df = videos_df.sort_values(by="Views", ascending=False)
-    upload_to_sheets(videos_df, comments_df)
+# ----- STREAMLIT UI -----
+st.title("📥 YouTube Data Collection")
+st.markdown("Fetch the latest trending videos and comments for your marketing topics.")
+
+col1, col2 = st.columns(2)
+with col1:
+    st.info(f"**Topics:** {', '.join(TOPICS)}")
+with col2:
+    if st.button("🚀 Start Scraping YouTube", type="primary"):
+        with st.spinner("Connecting to YouTube API..."):
+            videos_df, comments_df = collect_videos_and_comments()
+            
+            if not videos_df.empty:
+                videos_df = videos_df.sort_values(by="Views", ascending=False)
+                
+                st.write("### 📹 Video Metrics")
+                st.dataframe(videos_df.head(10))
+                
+                st.write("### 💬 Comment Samples")
+                st.dataframe(comments_df.head(10))
+                
+                upload_to_sheets(videos_df, comments_df)
+            else:
+                st.warning("No videos found. Check API quota or topics.")

@@ -11,21 +11,21 @@ from nltk.corpus import stopwords
 import nltk
 import requests
 
-# Download nltk resource quietly
-nltk.download("stopwords", quiet=True)
+# ----- NLTK SETUP (Robust Fix) -----
+import nltk
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+from nltk.corpus import stopwords
 STOPWORDS = set(stopwords.words("english"))
 
-# ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
+# ----- AUTHENTICATION SETUP -----
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
-    # 1. Try Streamlit Secrets (Cloud)
-    try:
-        if hasattr(st, "secrets") and key_name in st.secrets:
-            return st.secrets[key_name]
-    except Exception:
-        pass 
-
-    # 2. Try Local .env (Laptop)
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
     try:
         from dotenv import load_dotenv
         load_dotenv("secrettt.env")
@@ -47,9 +47,9 @@ def connect_sheets():
             client = gspread.authorize(creds)
             return client.open("Content Performance Tracker")
     except Exception:
-        pass
+        pass 
 
-    # B. Try Local File (Check Current and Parent)
+    # B. Try Local File
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
@@ -97,7 +97,8 @@ def generate_marketing_content(product_info, content_type, tone, keywords):
                     {"role": "system", "content": "You are a creative AI marketing assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=200,
+                # ⚡ INCREASED TOKENS HERE (was 200, now 800)
+                max_tokens=800,
                 temperature=0.7,
             )
             text = response.choices[0].message["content"].strip()

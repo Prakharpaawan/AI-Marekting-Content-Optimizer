@@ -34,10 +34,10 @@ def get_secret(key_name):
         return None
 
 def connect_sheets():
-    """Connect to Google Sheets using Cloud Secrets OR Local JSON (Robust Path Check)"""
+    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # A. Try Cloud Secrets (Streamlit Cloud)
+    # A. Try Cloud Secrets
     try:
         if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
@@ -47,15 +47,15 @@ def connect_sheets():
             client = gspread.authorize(creds)
             return client.open("Content Performance Tracker")
     except Exception:
-        pass 
+        pass
 
-    # B. Try Local File (Laptop) - CHECK BOTH LOCATIONS
+    # B. Try Local File (Check Current and Parent)
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
-        st.error("❌ Critical Error: credentials.json not found in current or parent directory.")
+        st.error("❌ Critical Error: No Google Credentials found!")
         st.stop()
         
     client = gspread.authorize(creds)
@@ -115,12 +115,10 @@ def upload_generated_content(records):
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title=GENERATED_TAB_NAME, rows="1000", cols="20")
 
-    # If sheet is empty, add headers
     if not ws.get_all_values():
         headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", "Model", "Content", "Error"]
         ws.append_row(headers)
 
-    # Prepare rows
     rows_to_add = []
     for r in records:
         rows_to_add.append([
@@ -160,8 +158,6 @@ if submitted:
         results = []
         kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
         
-        # Loop through combinations
-        total_ops = len(content_types) * len(tones)
         completed = 0
         
         for ctype in content_types:
@@ -171,4 +167,29 @@ if submitted:
                 
                 results.append({
                     "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Product Info":
+                    "Product Info": product_name,
+                    "Content Type Requested": ctype,
+                    "Tone Requested": tone,
+                    "Keywords Used": keywords,
+                    "Model Used": model,
+                    "Generated Content": content,
+                    "Error Message": err
+                })
+                
+                if content:
+                    send_slack_message(f"✨ New {ctype} generated for {product_name}!")
+                
+                completed += 1
+        
+        status.update(label="✅ Generation Complete!", state="complete", expanded=False)
+        
+        for res in results:
+            with st.expander(f"{res['Tone Requested']} {res['Content Type Requested']}", expanded=True):
+                if res['Error Message']:
+                    st.error(res['Error Message'])
+                else:
+                    st.write(res['Generated Content'])
+                    st.caption(f"Model: {res['Model Used']}")
+        
+        if results:
+            upload_generated_content(results)

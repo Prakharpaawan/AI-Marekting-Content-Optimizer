@@ -47,153 +47,155 @@ def connect_sheets():
     return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
-INPUT_TAB = "Sentiment_Results_All"
+SENTIMENT_TAB = "Sentiment_Results_All"
+YOUTUBE_TAB = "YouTube Data"
+REDDIT_TAB = "Reddit Posts"
 OUTPUT_TAB = "Content_Insights"
 
 # ----- HELPERS -----
-def safe_get_worksheet(sheet, tab_name):
+def safe_get_df(sheet, tab_name):
     try:
-        return sheet.worksheet(tab_name)
+        ws = sheet.worksheet(tab_name)
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
     except gspread.exceptions.WorksheetNotFound:
-        return None
+        return pd.DataFrame()
 
+def clean_numeric(df, col):
+    """Safely convert a column to numeric, setting errors to 0."""
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors='coerce').fillna(0)
+    return 0
+
+# ----- CALCULATION LOGIC -----
 def calculate_metrics():
     sheet = connect_sheets()
-    ws = safe_get_worksheet(sheet, INPUT_TAB)
-
-    if ws is None:
-        st.error(f"Tab '{INPUT_TAB}' is missing. Run Sentiment Analysis first.")
-        return None, None
-
-    df = pd.DataFrame(ws.get_all_records())
     
-    if df.empty:
-        st.warning("No data found in Sentiment Results.")
-        return None, None
+    # 1. Load All Data Sources
+    df_sent = safe_get_df(sheet, SENTIMENT_TAB)
+    df_yt = safe_get_df(sheet, YOUTUBE_TAB)
+    df_red = safe_get_df(sheet, REDDIT_TAB)
 
-    # Clean & Convert Scores
-    df = df.fillna("")
-    if "Compound Score" in df.columns:
-        score_col = "Compound Score" 
-    elif "compound" in df.columns:
-        score_col = "compound"
-    else:
-        st.error("Could not find sentiment score column.")
-        return None, None
-
-    df[score_col] = pd.to_numeric(df[score_col], errors="coerce").fillna(0)
-    
-    # Handle Label Column Name variations
-    label_col = "Sentiment Label" if "Sentiment Label" in df.columns else "Sentiment_Label"
-
-    # --- METRICS CALCULATION ---
     metrics = {}
-    metrics["total_items"] = len(df)
-    
-    # Sentiment Distribution
-    if label_col in df.columns:
-        metrics["positive_pct"] = round((df[label_col].str.lower() == "positive").mean() * 100, 1)
-        metrics["negative_pct"] = round((df[label_col].str.lower() == "negative").mean() * 100, 1)
-        metrics["neutral_pct"] = round((df[label_col].str.lower() == "neutral").mean() * 100, 1)
+
+    # --- YOUTUBE METRICS ---
+    if not df_yt.empty:
+        # Columns: Views, Likes, Comments
+        df_yt["Views"] = clean_numeric(df_yt, "Views")
+        df_yt["Likes"] = clean_numeric(df_yt, "Likes")
+        df_yt["Comments"] = clean_numeric(df_yt, "Comments")
+        
+        # Calculate Engagement Rate: (Likes + Comments) / Views * 100
+        # Avoid division by zero
+        df_yt["Engagement"] = ((df_yt["Likes"] + df_yt["Comments"]) / df_yt["Views"].replace(0, 1)) * 100
+        
+        metrics["yt_avg_engagement"] = round(df_yt["Engagement"].mean(), 2)
+        
+        # Top Video
+        top_vid = df_yt.sort_values(by="Views", ascending=False).iloc[0]
+        metrics["yt_top_content"] = f"{top_vid.get('Video Title', 'Unknown')} ({top_vid.get('Views')} views)"
     else:
-        metrics["positive_pct"] = 0
-        metrics["negative_pct"] = 0
-        metrics["neutral_pct"] = 0
+        metrics["yt_avg_engagement"] = "No Data"
+        metrics["yt_top_content"] = "No Data"
 
-    metrics["avg_sentiment"] = round(df[score_col].mean(), 3)
-
-    # Top & Bottom Content
-    top_row = df.sort_values(by=score_col, ascending=False).iloc[0]
-    bottom_row = df.sort_values(by=score_col, ascending=True).iloc[0]
-    
-    metrics["top_text"] = top_row.get("Text", "")[:150]
-    metrics["bottom_text"] = bottom_row.get("Text", "")[:150]
-
-    # Platform Analysis
-    if "Source" in df.columns:
-        metrics["most_active"] = df["Source"].value_counts().idxmax()
-        platform_scores = df.groupby("Source")[score_col].mean()
-        metrics["most_positive"] = platform_scores.idxmax()
-        metrics["most_negative"] = platform_scores.idxmin()
+    # --- REDDIT METRICS ---
+    if not df_red.empty:
+        # Columns: Upvotes, Comments
+        df_red["Upvotes"] = clean_numeric(df_red, "Upvotes")
+        df_red["Comments"] = clean_numeric(df_red, "Comments")
+        
+        # Simple Engagement: Upvotes + Comments
+        df_red["Engagement"] = df_red["Upvotes"] + df_red["Comments"]
+        
+        metrics["red_avg_engagement"] = round(df_red["Engagement"].mean(), 2)
+        
+        # Top Post
+        top_post = df_red.sort_values(by="Upvotes", ascending=False).iloc[0]
+        metrics["red_top_content"] = f"{top_post.get('Title', 'Unknown')} ({top_post.get('Upvotes')} upvotes)"
     else:
-        metrics["most_active"] = "N/A"
-        metrics["most_positive"] = "N/A"
-        metrics["most_negative"] = "N/A"
+        metrics["red_avg_engagement"] = "No Data"
+        metrics["red_top_content"] = "No Data"
 
-    # Topic Analysis
-    if "Topic" in df.columns:
-        metrics["common_topic"] = df["Topic"].value_counts().idxmax()
+    # --- SENTIMENT METRICS ---
+    if not df_sent.empty:
+        # Check column names (Compound Score or compound)
+        score_col = "Compound Score" if "Compound Score" in df_sent.columns else "compound"
+        label_col = "Sentiment Label" if "Sentiment Label" in df_sent.columns else "Sentiment_Label"
+        
+        df_sent[score_col] = clean_numeric(df_sent, score_col)
+        
+        metrics["avg_sentiment"] = round(df_sent[score_col].mean(), 3)
+        
+        if label_col in df_sent.columns:
+            metrics["pos_pct"] = round((df_sent[label_col].str.lower() == "positive").mean() * 100, 1)
+            metrics["neg_pct"] = round((df_sent[label_col].str.lower() == "negative").mean() * 100, 1)
+        else:
+            metrics["pos_pct"] = 0
+            metrics["neg_pct"] = 0
+            
+        metrics["total_items"] = len(df_sent)
     else:
-        metrics["common_topic"] = "N/A"
+        metrics["avg_sentiment"] = 0
+        metrics["pos_pct"] = 0
+        metrics["neg_pct"] = 0
+        metrics["total_items"] = 0
 
     return metrics, sheet
 
 def upload_insights(sheet, metrics):
-    if not metrics: return
-
-    out_data = [
+    data = [
         ["Metric", "Value"],
+        ["YouTube Avg Engagement %", metrics["yt_avg_engagement"]],
+        ["Top YouTube Video", metrics["yt_top_content"]],
+        ["Reddit Avg Engagement (Score)", metrics["red_avg_engagement"]],
+        ["Top Reddit Post", metrics["red_top_content"]],
+        ["Avg Sentiment Score", metrics["avg_sentiment"]],
+        ["Positive Sentiment %", f"{metrics['pos_pct']}%"],
+        ["Negative Sentiment %", f"{metrics['neg_pct']}%"],
         ["Total Items Analyzed", metrics["total_items"]],
-        ["Positive Sentiment %", f"{metrics['positive_pct']}%"],
-        ["Negative Sentiment %", f"{metrics['negative_pct']}%"],
-        ["Neutral Sentiment %", f"{metrics['neutral_pct']}%"],
-        ["Average Sentiment Score", metrics["avg_sentiment"]],
-        ["Most Active Platform", metrics["most_active"]],
-        ["Most Positive Platform", metrics["most_positive"]],
-        ["Most Negative Platform", metrics["most_negative"]],
-        ["Most Common Topic", metrics["common_topic"]],
-        ["Top Content Snippet", metrics["top_text"]],
-        ["Bottom Content Snippet", metrics["bottom_text"]],
         ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
     ]
-
+    
     try:
-        ws = safe_get_worksheet(sheet, OUTPUT_TAB)
-        if ws:
+        try:
+            ws = sheet.worksheet(OUTPUT_TAB)
             ws.clear()
-        else:
-            ws = sheet.add_worksheet(title=OUTPUT_TAB, rows="100", cols="5")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=OUTPUT_TAB, rows="50", cols="5")
         
-        ws.update(values=out_data, range_name="A1")
-        st.toast("Insights uploaded to Google Sheets!", icon="🚀")
+        ws.update(values=data, range_name="A1")
+        st.toast("Insights updated in Google Sheets!", icon="🚀")
     except Exception as e:
-        st.error(f"Failed to upload insights: {e}")
+        st.error(f"Upload failed: {e}")
 
 # ----- STREAMLIT UI -----
 st.title("📈 Performance Metrics Dashboard")
-st.markdown("Aggregated insights from all data sources.")
+st.markdown("Aggregated insights from YouTube, Reddit, and Sentiment Analysis.")
 
 if st.button("🚀 Generate Report", type="primary"):
-    with st.spinner("Calculating metrics..."):
+    with st.spinner("Calculating metrics across all platforms..."):
         metrics, sheet = calculate_metrics()
     
     if metrics:
-        # Key Metrics Row
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Items", metrics["total_items"])
-        col2.metric("Avg Sentiment", metrics["avg_sentiment"])
-        col3.metric("Positivity Rate", f"{metrics['positive_pct']}%")
-        col4.metric("Negativity Rate", f"{metrics['negative_pct']}%")
+        # Top Level Cards
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Avg Sentiment", metrics["avg_sentiment"])
+        col2.metric("YouTube Engagement", f"{metrics['yt_avg_engagement']}%")
+        col3.metric("Reddit Engagement", metrics["red_avg_engagement"])
 
         st.divider()
 
-        # Platform Insights
-        st.subheader("Platform Analysis")
-        c1, c2, c3 = st.columns(3)
-        c1.info(f"**Most Active:** {metrics['most_active']}")
-        c2.success(f"**Most Positive:** {metrics['most_positive']}")
-        c3.error(f"**Most Negative:** {metrics['most_negative']}")
+        # Detailed Tables
+        st.subheader("🏆 Top Performing Content")
+        
+        st.info(f"**YouTube:** {metrics['yt_top_content']}")
+        st.success(f"**Reddit:** {metrics['red_top_content']}")
 
         st.divider()
-
-        # Content Highlights
-        st.subheader("Content Highlights")
-        
-        st.write("**:trophy: Best Performing Content (Highest Sentiment)**")
-        st.success(metrics["top_text"])
-        
-        st.write("**:warning: Lowest Performing Content (Lowest Sentiment)**")
-        st.error(metrics["bottom_text"])
+        st.subheader("📊 Sentiment Breakdown")
+        c1, c2 = st.columns(2)
+        c1.metric("Positive Content", f"{metrics['pos_pct']}%")
+        c2.metric("Negative Content", f"{metrics['neg_pct']}%")
 
         # Upload
         if sheet:

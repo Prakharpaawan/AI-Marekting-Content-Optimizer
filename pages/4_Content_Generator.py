@@ -1,85 +1,85 @@
-"""
-AI Content Generator (Multi-Product + Multi-Platform)
-
-Generate marketing content for multiple products (e.g., smart gadgets)
-across multiple platforms (Twitter, Instagram, LinkedIn, etc.)
-and log everything neatly in Google Sheets.
-
-Now includes:
-✅ Slack alerts for each generated content
-✅ Slack alerts for model failures
-"""
-
-# IMPORTS 
+import streamlit as st
 import os
+import json
 import re
-import pandas as pd
 from datetime import datetime
+import pandas as pd
 import gspread
-from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
+from huggingface_hub import InferenceClient
 from nltk.corpus import stopwords
 import nltk
-from huggingface_hub import InferenceClient
-import requests   # <-- for Slack
+import requests
 
-load_dotenv("secrettt.env")
-
-nltk.download("stopwords")
+# Download nltk resource quietly
+nltk.download("stopwords", quiet=True)
 STOPWORDS = set(stopwords.words("english"))
 
+# ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
+def get_secret(key_name):
+    """Fetch secret from Streamlit Cloud OR Local .env file"""
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
+    try:
+        from dotenv import load_dotenv
+        load_dotenv("secrettt.env")
+        return os.getenv(key_name)
+    except ImportError:
+        return None
 
-# ---------- CONFIG ----------
-GOOGLE_SHEET_NAME = "Content Performance Tracker"
-CREDENTIALS_FILE = "credentials.json"
+def connect_sheets():
+    """Connect to Google Sheets using Cloud Secrets (Nuclear Option) OR Local JSON"""
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
+    # A. Try Cloud Secrets
+    if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
+        try:
+            creds_dict = json.loads(st.secrets["gcp_credentials"])
+            # Auto-repair private key
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            return client.open("Content Performance Tracker")
+        except Exception as e:
+            st.error(f"❌ JSON Error: {e}")
+            st.stop()
+            
+    # B. Try Local File
+    local_creds = None
+    if os.path.exists("credentials.json"):
+        local_creds = "credentials.json"
+    elif os.path.exists("../credentials.json"):
+        local_creds = "../credentials.json"
+
+    if local_creds:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(local_creds, scope)
+        client = gspread.authorize(creds)
+        return client.open("Content Performance Tracker")
+    else:
+        st.error("❌ Critical Error: No Google Credentials found!")
+        st.stop()
+
+# ----- CONFIG -----
+HF_TOKEN = get_secret("HF_TOKEN")
+SLACK_WEBHOOK_URL = get_secret("SLACK_WEBHOOK_URL")
+
 GENERATED_TAB_NAME = "Generated_Marketing_Content"
-
-HF_TOKEN = os.getenv("HF_TOKEN")
 PRIMARY_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
 FALLBACK_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 
-# ---------- SLACK CONFIG ----------
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-
+# ----- HELPERS -----
 def send_slack_message(message):
-    """Send notification to Slack channel."""
+    if not SLACK_WEBHOOK_URL: return
     try:
-        payload = {"text": message}
-        requests.post(SLACK_WEBHOOK_URL, json=payload)
+        requests.post(SLACK_WEBHOOK_URL, json={"text": message})
     except Exception as e:
-        print("Slack Error:", e)
+        print(f"Slack Error: {e}")
 
-
-# ---------- GOOGLE SHEETS AUTH ----------
-def connect_to_sheets():
-    """Authenticate and connect to Google Sheets."""
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-    client_sheets = gspread.authorize(creds)
-    return client_sheets.open(GOOGLE_SHEET_NAME)
-
-
-# ---------- TEXT HELPERS ----------
-def clean_text(text):
-    """Clean and normalize text."""
-    if not isinstance(text, str):
-        return ""
-    text = re.sub(r"http\S+", " ", text)
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def tokenize(text):
-    """Split text into clean tokens."""
-    return [w for w in clean_text(text).split() if w not in STOPWORDS and len(w) > 2]
-
-
-# ---------- CONTENT GENERATION ----------
 def generate_marketing_content(product_info, content_type, tone, keywords):
-    """Generate platform-specific marketing content."""
+    if not HF_TOKEN:
+        return None, None, "Missing HF_TOKEN"
+
     prompt = (
         f"Generate a {tone} {content_type} for this product:\n"
         f"{product_info}\n"
@@ -88,7 +88,6 @@ def generate_marketing_content(product_info, content_type, tone, keywords):
     )
 
     for model in (PRIMARY_MODEL, FALLBACK_MODEL):
-        print(f"\n Trying model: {model}")
         try:
             client = InferenceClient(api_key=HF_TOKEN)
             response = client.chat.completions.create(
@@ -100,123 +99,103 @@ def generate_marketing_content(product_info, content_type, tone, keywords):
                 max_tokens=200,
                 temperature=0.7,
             )
-
             text = response.choices[0].message["content"].strip()
-
-            # SLACK ALERT → success
-            send_slack_message(
-                f"🟢 Generated {content_type} for product: *{product_info[:30]}...*\nModel: {model}"
-            )
-
-            print(f"Generated {content_type} using {model}")
             return text, model, None
-
         except Exception as e:
-            # SLACK ALERT → model failed
-            send_slack_message(f"🔴 Model failed: {model}\nError: {e}")
-            print(f" Model {model} failed: {e}")
+            print(f"Model {model} failed: {e}")
+            continue
 
-    # If all models fail
     return None, None, "All models failed."
 
-
-# ---------- UPLOAD RESULTS ----------
 def upload_generated_content(records):
-    """Upload generated results to Google Sheets."""
-    sheet = connect_to_sheets()
+    sheet = connect_sheets()
     try:
         ws = sheet.worksheet(GENERATED_TAB_NAME)
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title=GENERATED_TAB_NAME, rows="1000", cols="20")
 
-    headers = [
-        "Timestamp",
-        "Product Info",
-        "Content Type Requested",
-        "Tone Requested",
-        "Keywords Used",
-        "Model Used",
-        "Generated Content",
-        "Error Message",
-    ]
-    data_rows = [[r.get(h, "") for h in headers] for r in records]
-    ws.clear()
-    ws.update("A1", [headers] + data_rows)
+    # If sheet is empty, add headers
+    if not ws.get_all_values():
+        headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", "Model", "Content", "Error"]
+        ws.append_row(headers)
 
-    # SLACK ALERT
-    send_slack_message(f"📤 Uploaded {len(records)} generated posts to Google Sheets.")
+    # Prepare rows
+    rows_to_add = []
+    for r in records:
+        rows_to_add.append([
+            r["Timestamp"], r["Product Info"], r["Content Type Requested"],
+            r["Tone Requested"], r["Keywords Used"], r["Model Used"],
+            r["Generated Content"], r["Error Message"]
+        ])
+    
+    ws.append_rows(rows_to_add)
+    st.toast(f"Uploaded {len(records)} posts to Sheets!", icon="✅")
 
-    print(f"📤 Uploaded {len(records)} rows to Google Sheets → {GENERATED_TAB_NAME}")
+# ----- STREAMLIT UI -----
+st.title("✍️ AI Content Generator")
+st.markdown("Generate multi-platform marketing posts for your products instantly.")
 
+with st.form("gen_form"):
+    product_name = st.text_input("Product Name", "LumiCharge Pro")
+    product_desc = st.text_area("Product Description", "A smart desk lamp with wireless charging...")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        content_types = st.multiselect("Content Types", 
+            ["Tweet", "LinkedIn Post", "Instagram Caption", "Ad Copy"], 
+            default=["Tweet", "LinkedIn Post"])
+    with col2:
+        tones = st.multiselect("Tones", ["Professional", "Witty", "Urgent", "Friendly"], default=["Professional"])
+        
+    keywords = st.text_input("Keywords (comma separated)", "smart, efficiency, design")
+    
+    submitted = st.form_submit_button("🚀 Generate Content")
 
-# ---------- MAIN ----------
-def main():
-    print("\nStarting AI Multi-Product, Multi-Platform Content Generator")
-
-    # Define common trending keywords
-    common_keywords = [
-        "marketing", "content", "strategy", "digital", "growth",
-        "productivity", "innovation", "design", "smart", "brand"
-    ]
-
-    # Define products
-    products = [
-        {
-            "name": "LumiCharge Pro",
-            "info": "Introducing 'LumiCharge Pro' — a smart desk lamp with wireless charging, adjustable brightness, and minimalist design for productivity and comfort.",
-        },
-        {
-            "name": "WorkPod Mini",
-            "info": "Meet 'WorkPod Mini' — a compact, soundproof workspace pod with ergonomic lighting and smart temperature control designed for focus and creativity.",
-        },
-    ]
-
-    # Define platforms
-    content_requests = [
-        {"type": "tweet", "tone": "exciting"},
-        {"type": "short ad copy", "tone": "persuasive"},
-        {"type": "Instagram caption", "tone": "fun and trendy"},
-        {"type": "LinkedIn post", "tone": "professional and inspiring"},
-        {"type": "YouTube description", "tone": "informative"},
-        {"type": "Facebook post", "tone": "friendly and engaging"},
-    ]
-
-    generated_records = []
-
-    # Loop through products and platforms
-    for product in products:
-        print(f"\nGenerating content for: {product['name']}")
-        send_slack_message(f"✨ Starting content generation for product: {product['name']}")
-
-        for req in content_requests:
-            product_keywords = common_keywords[:5] if product["name"] == "LumiCharge Pro" else common_keywords[5:]
-
-            content, model, error = generate_marketing_content(
-                product_info=product["info"],
-                content_type=req["type"],
-                tone=req["tone"],
-                keywords=product_keywords,
-            )
-
-            generated_records.append({
-                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Product Info": product["info"],
-                "Content Type Requested": req["type"],
-                "Tone Requested": req["tone"],
-                "Keywords Used": ", ".join(product_keywords),
-                "Model Used": model,
-                "Generated Content": content,
-                "Error Message": error,
-            })
-
-    upload_generated_content(generated_records)
-
-    # Final Slack alert
-    send_slack_message("🎯 Content generation completed successfully!")
-
-    print("\n🎯 Content generation completed successfully for all products!")
-
-
-# ENTRY 
-if __name__ == "__main__":
-    main()
+if submitted:
+    if not product_desc:
+        st.error("Please enter a product description.")
+    else:
+        status = st.status("🤖 AI Agents working...", expanded=True)
+        results = []
+        kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+        
+        # Loop through combinations
+        total_ops = len(content_types) * len(tones)
+        completed = 0
+        
+        for ctype in content_types:
+            for tone in tones:
+                status.write(f"Drafting {tone} {ctype}...")
+                content, model, err = generate_marketing_content(product_desc, ctype, tone, kw_list)
+                
+                results.append({
+                    "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Product Info": product_name,
+                    "Content Type Requested": ctype,
+                    "Tone Requested": tone,
+                    "Keywords Used": keywords,
+                    "Model Used": model,
+                    "Generated Content": content,
+                    "Error Message": err
+                })
+                
+                if content:
+                    # Send Slack Notification
+                    send_slack_message(f"✨ New {ctype} generated for {product_name}!")
+                
+                completed += 1
+        
+        status.update(label="✅ Generation Complete!", state="complete", expanded=False)
+        
+        # Display Results
+        for res in results:
+            with st.expander(f"{res['Tone Requested']} {res['Content Type Requested']}", expanded=True):
+                if res['Error Message']:
+                    st.error(res['Error Message'])
+                else:
+                    st.write(res['Generated Content'])
+                    st.caption(f"Model: {res['Model Used']}")
+        
+        # Upload
+        if results:
+            upload_generated_content(results)

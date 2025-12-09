@@ -1,356 +1,213 @@
-# unified_sentiment_metrics.py
-"""
-Unified Sentiment & Metrics (Option B — Balanced text)
-Reads platform tabs, combines content, runs sentiment, writes results and dashboard,
-and posts summarized alerts to Slack.
-
-Usage:
-    python unified_sentiment_metrics.py
-
-Notes:
-- Make sure credentials.json is present (service account for Google Sheets).
-- Update SLACK_WEBHOOK if you want alerts to a different webhook.
-"""
-
+import streamlit as st
 import os
-import math
+import json
 import re
-from datetime import datetime
+import math
 import pandas as pd
 import gspread
-from dotenv import load_dotenv
-from oauth2client.service_account import ServiceAccountCredentials
+import requests
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import requests
+from oauth2client.service_account import ServiceAccountCredentials
+from dotenv import load_dotenv
 
-load_dotenv("secrettt.env")
+# ----- NLTK SETUP -----
+try:
+    nltk.data.find('sentiment/vader_lexicon.zip')
+except LookupError:
+    nltk.download('vader_lexicon')
 
-# ensure vader lexicon exists
-nltk.download("vader_lexicon", quiet=True)
+# ----- AUTHENTICATION SETUP -----
+def get_secret(key_name):
+    """Fetch secret from Streamlit Cloud OR Local .env file"""
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
+    try:
+        load_dotenv("secrettt.env")
+        return os.getenv(key_name)
+    except ImportError:
+        return None
 
-# ------------- CONFIG -------------
-GOOGLE_SHEET_NAME = "Content Performance Tracker"
-CREDENTIALS_FILE = "credentials.json"
+def connect_sheets():
+    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
+    # A. Try Cloud Secrets
+    try:
+        if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
+            creds_dict = json.loads(st.secrets["gcp_credentials"])
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            return client.open("Content Performance Tracker")
+    except Exception:
+        pass
 
-# Input tabs (expected to exist in your sheet)
+    # B. Try Local File
+    if os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    elif os.path.exists("../credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
+    else:
+        st.error("❌ Critical Error: No Google Credentials found!")
+        st.stop()
+        
+    client = gspread.authorize(creds)
+    return client.open("Content Performance Tracker")
+
+# ----- CONFIG -----
+SLACK_WEBHOOK = get_secret("SLACK_WEBHOOK_URL")
+
+# Input tabs
 YOUTUBE_TAB = "YouTube Data"
-YOUTUBE_COMMENTS_TAB = "YouTube Comments"       # if you have this (optional)
-REDDIT_TAB = "Reddit Data"
-REDDIT_COMMENTS_TAB = "Reddit Comments"         # if you have this (optional)
+REDDIT_TAB = "Reddit Posts" # Updated to match your actual tab name
+REDDIT_COMMENTS_TAB = "Reddit Comments"
 ARTICLES_TAB = "Articles"
 
-# Output tabs that this script will create/overwrite
+# Output tabs
 ALL_SOURCES_TAB = "All_Content_Sources"
 SENTIMENT_RESULTS_TAB = "Sentiment_Results_All"
 DASHBOARD_TAB = "Performance_Dashboard"
 
-# Slack webhook (replace if you want another)
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
-
-# Thresholds for labeling and alerts
 POSITIVE_THRESHOLD = 0.05
 NEGATIVE_THRESHOLD = -0.05
-NEGATIVE_SHARE_ALERT = 0.30  # send Slack alert if negative % > 30%
 
-# ------------- HELPERS -------------
+# ----- HELPERS -----
 def send_slack(text):
-    """Post a simple message to Slack webhook (best-effort)."""
-    if not SLACK_WEBHOOK:
-        return
+    if not SLACK_WEBHOOK: return
     try:
         requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10)
     except Exception:
         pass
 
-
-def connect_to_sheets():
-    """Authenticate with Google Sheets and return a Worksheet client (gspread.Spreadsheet)."""
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-    client = gspread.authorize(creds)
-    return client.open(GOOGLE_SHEET_NAME)
-
-
-def safe_get_sheet(spreadsheet, name):
-    """Return worksheet object or None if not found."""
-    try:
-        return spreadsheet.worksheet(name)
-    except gspread.exceptions.WorksheetNotFound:
-        return None
-
-
-def first_n(text, n):
-    if not isinstance(text, str):
-        return ""
-    return text.strip()[:n]
-
-
 def normalize_whitespace(s):
-    if not isinstance(s, str):
-        return ""
+    if not isinstance(s, str): return ""
     return re.sub(r"\s+", " ", s).strip()
 
-
-# ------------- READERS -------------
-def read_tab_df(spreadsheet, tab_name):
-    """Read sheet tab into a DataFrame or return empty DataFrame if missing."""
-    ws = safe_get_sheet(spreadsheet, tab_name)
-    if ws is None:
+def safe_get_worksheet(sheet, name):
+    try:
+        return pd.DataFrame(sheet.worksheet(name).get_all_records())
+    except gspread.exceptions.WorksheetNotFound:
         return pd.DataFrame()
-    rows = ws.get_all_records()
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
 
-
-def build_all_sources_df(ss):
-    """
-    Build combined DataFrame (Option B balanced):
-      - youtube: Title + first 300 chars of Description
-      - reddit posts: Title + first 400 chars of Post Text
-      - reddit comments: full comment text
-      - articles: Title + first 300 chars of Link/summary (if exists)
-    The result has columns:
-      Source, Content Type, Text, URL, Topic, Date, Raw (original dict)
-    """
+# ----- DATA PROCESSING -----
+def build_combined_df(sheet):
     pieces = []
-
-    # YouTube data (Title + description snippet)
-    yt = read_tab_df(ss, YOUTUBE_TAB)
+    
+    # YouTube Data
+    yt = safe_get_worksheet(sheet, YOUTUBE_TAB)
     if not yt.empty:
         for _, r in yt.iterrows():
-            title = r.get("Video Title") or r.get("Title") or ""
-            desc = r.get("Description") or ""
-            text = normalize_whitespace(f"{title}. {first_n(desc,300)}")
+            text = f"{r.get('Video Title', '')}. {r.get('Description', '')[:300]}"
             pieces.append({
-                "Source": "YouTube",
-                "Content Type": "video",
-                "Text": text,
-                "URL": r.get("URL") or r.get("Video URL") or "",
+                "Source": "YouTube", "Content Type": "video",
+                "Text": normalize_whitespace(text),
+                "URL": f"https://www.youtube.com/watch?v={r.get('Video ID', '')}",
                 "Topic": r.get("Topic", ""),
-                "Date": r.get("Published Date") or r.get("Published At") or "",
-                "Raw": r
+                "Date": r.get("Published Date", "")
             })
 
-    # YouTube comments (if present) — treat as comment content
-    ytc = read_tab_df(ss, YOUTUBE_COMMENTS_TAB)
-    if not ytc.empty:
-        for _, r in ytc.iterrows():
-            comment = r.get("Comment") or r.get("Text") or r.get("Comment Text") or ""
-            text = normalize_whitespace(comment)
-            pieces.append({
-                "Source": "YouTube",
-                "Content Type": "comment",
-                "Text": text,
-                "URL": r.get("URL") or "",
-                "Topic": r.get("Topic", ""),
-                "Date": r.get("Published Date") or r.get("Date") or "",
-                "Raw": r
-            })
-
-    # Reddit posts
-    rd = read_tab_df(ss, REDDIT_TAB)
+    # Reddit Posts
+    rd = safe_get_worksheet(sheet, REDDIT_TAB)
     if not rd.empty:
         for _, r in rd.iterrows():
-            title = r.get("Title") or ""
-            post_text = r.get("Post Text") or r.get("Selftext") or ""
-            text = normalize_whitespace(f"{title}. {first_n(post_text,400)}")
+            text = f"{r.get('Title', '')}. {r.get('Post Text', '')[:400]}"
             pieces.append({
-                "Source": "Reddit",
-                "Content Type": "post",
-                "Text": text,
-                "URL": r.get("URL") or "",
+                "Source": "Reddit", "Content Type": "post",
+                "Text": normalize_whitespace(text),
+                "URL": r.get("URL", ""),
                 "Topic": r.get("Subreddit", ""),
-                "Date": r.get("Created Date") or r.get("Date") or "",
-                "Raw": r
+                "Date": r.get("Created Date", "")
             })
 
-    # Reddit comments (if present)
-    rdc = read_tab_df(ss, REDDIT_COMMENTS_TAB)
-    if not rdc.empty:
-        for _, r in rdc.iterrows():
-            comment = r.get("Comment") or r.get("Body") or r.get("Text") or ""
-            pieces.append({
-                "Source": "Reddit",
-                "Content Type": "comment",
-                "Text": normalize_whitespace(comment),
-                "URL": r.get("URL") or "",
-                "Topic": r.get("Subreddit", ""),
-                "Date": r.get("Created Date") or r.get("Date") or "",
-                "Raw": r
-            })
-
-    # Articles (title + snippet)
-    art = read_tab_df(ss, ARTICLES_TAB)
+    # News Articles
+    art = safe_get_worksheet(sheet, ARTICLES_TAB)
     if not art.empty:
         for _, r in art.iterrows():
-            title = r.get("Title") or r.get("Headline") or ""
-            snippet = r.get("Summary", "") or r.get("Link Summary", "") or r.get("Link", "")
-            # first 300 chars of snippet
+            text = f"{r.get('Title', '')}. {r.get('Snippet', '')[:300]}"
             pieces.append({
-                "Source": "News",
-                "Content Type": "article",
-                "Text": normalize_whitespace(f"{title}. {first_n(snippet,300)}"),
-                "URL": r.get("Link") or r.get("URL") or "",
+                "Source": "News", "Content Type": "article",
+                "Text": normalize_whitespace(text),
+                "URL": r.get("Link", ""),
                 "Topic": r.get("Topic", ""),
-                "Date": r.get("Date") or "",
-                "Raw": r
+                "Date": r.get("Collected At", "")
             })
 
-    if not pieces:
-        return pd.DataFrame()
+    return pd.DataFrame(pieces)
 
-    df = pd.DataFrame(pieces)
-    # ensure Text is str
-    df["Text"] = df["Text"].fillna("").astype(str)
+def analyze_sentiment(df):
+    sid = SentimentIntensityAnalyzer()
+    
+    def get_score(text):
+        if not text or not isinstance(text, str): return 0.0
+        return sid.polarity_scores(text)['compound']
+
+    df['Compound Score'] = df['Text'].apply(get_score)
+    
+    def get_label(score):
+        if score >= POSITIVE_THRESHOLD: return "Positive"
+        if score <= NEGATIVE_THRESHOLD: return "Negative"
+        return "Neutral"
+        
+    df['Sentiment Label'] = df['Compound Score'].apply(get_label)
     return df
 
-
-# ------------- SENTIMENT -------------
-def run_sentiment(df):
-    """Run VADER sentiment and return DataFrame with scores and label."""
-    sid = SentimentIntensityAnalyzer()
-    scores = df["Text"].apply(lambda t: sid.polarity_scores(t) if isinstance(t, str) and t.strip() else {"neg":0.0,"neu":1.0,"pos":0.0,"compound":0.0})
-    scores_df = pd.DataFrame(list(scores))
-    out = pd.concat([df.reset_index(drop=True), scores_df.reset_index(drop=True)], axis=1)
-
-    def label_row(c):
-        if c >= POSITIVE_THRESHOLD:
-            return "positive"
-        if c <= NEGATIVE_THRESHOLD:
-            return "negative"
-        return "neutral"
-
-    out["Sentiment_Label"] = out["compound"].apply(label_row)
-    return out
-
-
-# ------------- AGGREGATIONS & DASHBOARD -------------
-def build_dashboard(sent_df):
-    """
-    Build aggregated metrics per Content Type (video, post, comment, article).
-    Returns a DataFrame with summary rows.
-    """
-    if sent_df.empty:
-        return pd.DataFrame()
-
-    group_cols = ["Content Type"]
-    agg = sent_df.groupby(group_cols).agg(
-        Posts=("Text", "count"),
-        Avg_Compound=("compound", "mean"),
-        Avg_Positive=("pos", "mean"),
-        Avg_Negative=("neg", "mean"),
-    ).reset_index()
-
-    # compute percent positive/negative counts
-    pct = sent_df.groupby("Content Type")["Sentiment_Label"].value_counts(normalize=True).unstack(fill_value=0)
-    pct = pct.rename(columns=lambda c: f"PCT_{c.upper()}" )
-
-    agg = agg.merge(pct, on="Content Type", how="left")
-    # round numbers nicely
-    agg[["Avg_Compound", "Avg_Positive", "Avg_Negative"]] = agg[["Avg_Compound", "Avg_Positive", "Avg_Negative"]].round(3)
-    # convert proportions to percentages for PCT_ columns if present
-    for col in agg.columns:
-        if col.startswith("PCT_"):
-            agg[col] = (agg[col] * 100).round(1)
-
-    return agg
-
-
-# ------------- UPLOAD OUTPUTS -------------
-def upload_df_to_sheet(spreadsheet, df, tab_name):
-    """Create or overwrite a sheet tab with the given dataframe."""
-    if df is None:
-        return
+def upload_results(sheet, df, tab_name):
     try:
         try:
-            ws = spreadsheet.worksheet(tab_name)
-            # clear existing
+            ws = sheet.worksheet(tab_name)
             ws.clear()
         except gspread.exceptions.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title=tab_name, rows="1000", cols="20")
-        # prepare values: list of lists
-        values = [df.columns.values.tolist()] + df.fillna("").values.tolist()
-        # gspread update order: (values, range_name)
-        ws.update(values, "A1", value_input_option="USER_ENTERED")
+            ws = sheet.add_worksheet(title=tab_name, rows="2000", cols="20")
+        
+        ws.update(values=[df.columns.tolist()] + df.astype(str).values.tolist(), range_name="A1")
     except Exception as e:
-        print(f"Failed to upload tab {tab_name}: {e}")
+        st.error(f"Failed to upload {tab_name}: {e}")
 
+# ----- STREAMLIT UI -----
+st.title("📊 Sentiment Analysis Dashboard")
+st.markdown("Analyze sentiment trends across YouTube, Reddit, and News.")
 
-# ------------- MAIN WORKFLOW -------------
-def main():
-    send_slack(":rocket: Starting Unified Sentiment & Metrics (Option B - balanced)")
-    print("Starting Unified Sentiment & Metrics (Option B - balanced)")
-
-    try:
-        ss = connect_to_sheets()
-    except Exception as e:
-        msg = f"ERROR: Could not connect to Google Sheets: {e}"
-        print(msg)
-        send_slack(f":x: {msg}")
-        return
-
-    # 1) Combine content
-    combined = build_all_sources_df(ss)
-    if combined.empty:
-        msg = "No content found in source tabs. Ensure tabs exist and contain data."
-        print(msg)
-        send_slack(f":warning: {msg}")
-        return
-
-    # 2) Save combined content tab
-    upload_df_to_sheet(ss, combined[["Source","Content Type","Text","URL","Topic","Date"]], ALL_SOURCES_TAB)
-    send_slack(f":inbox_tray: Combined {len(combined)} items into *{ALL_SOURCES_TAB}*")
-
-    # 3) Run sentiment
-    sentiment_df = run_sentiment(combined)
-    # push to Sentiment_Results_All (include scores)
-    sentiment_out = sentiment_df.drop(columns=["Raw"], errors="ignore")
-    upload_df_to_sheet(ss, sentiment_out, SENTIMENT_RESULTS_TAB)
-    send_slack(f":receipt: Saved {len(sentiment_out)} sentiment results to *{SENTIMENT_RESULTS_TAB}*")
-
-    # 4) Build dashboard
-    dashboard = build_dashboard(sentiment_out)
-    if dashboard.empty:
-        print("Dashboard empty.")
+if st.button("🚀 Run Analysis", type="primary"):
+    with st.spinner("Connecting to Google Sheets..."):
+        sheet = connect_sheets()
+        
+    with st.spinner("Aggregating data from all sources..."):
+        combined_df = build_combined_df(sheet)
+        
+    if combined_df.empty:
+        st.warning("No data found in source tabs (YouTube, Reddit, Articles). Run those modules first.")
     else:
-        upload_df_to_sheet(ss, dashboard, DASHBOARD_TAB)
-        send_slack(":bar_chart: Updated performance metrics dashboard.")
-
-    # 5) Post a short summary and alert if negative share high
-    # Create per content-type summary text
-    summary_lines = []
-    for _, row in dashboard.iterrows():
-        ctype = row["Content Type"]
-        posts = int(row["Posts"])
-        avg = float(row["Avg_Compound"])
-        pct_pos = float(row.get("PCT_POSITIVE", 0.0))
-        pct_neg = float(row.get("PCT_NEGATIVE", 0.0))
-        summary_lines.append(f"• {ctype}\n   - Posts: {posts}\n   - Avg Sentiment: {avg:.2f}\n   - Positive: {pct_pos:.0f}%\n   - Negative: {pct_neg:.0f}%")
-
-    summary_text = "*Daily Sentiment Summary*\n" + "\n".join(summary_lines)
-    send_slack(f":bar_chart: {summary_text}")
-
-    # alert condition: any content type with negative percentage > threshold
-    alerts = []
-    for _, row in dashboard.iterrows():
-        pct_neg = float(row.get("PCT_NEGATIVE", 0.0))
-        if pct_neg / 100.0 > NEGATIVE_SHARE_ALERT:
-            alerts.append((row["Content Type"], pct_neg))
-
-    if alerts:
-        alert_text = ":rotating_light: *Negative sentiment spike detected*:\n" + "\n".join(
-            [f"- {ctype}: {pct:.1f}% negative" for ctype, pct in alerts]
+        st.write(f"### 📥 Analyzed {len(combined_df)} content items")
+        
+        with st.spinner("Running VADER Sentiment Analysis..."):
+            results_df = analyze_sentiment(combined_df)
+            
+        # Display Summary Metrics
+        col1, col2, col3 = st.columns(3)
+        avg_score = results_df['Compound Score'].mean()
+        pos_pct = (results_df['Sentiment Label'] == 'Positive').mean() * 100
+        neg_pct = (results_df['Sentiment Label'] == 'Negative').mean() * 100
+        
+        col1.metric("Avg Sentiment Score", f"{avg_score:.2f}")
+        col2.metric("Positive Content", f"{pos_pct:.1f}%")
+        col3.metric("Negative Content", f"{neg_pct:.1f}%")
+        
+        # Display Data Table with Full Columns
+        st.write("### Detailed Sentiment Report")
+        st.dataframe(
+            results_df[['Source', 'Content Type', 'Sentiment Label', 'Compound Score', 'Text']],
+            column_config={
+                "Text": st.column_config.TextColumn("Content Snippet", width="large"),
+                "Compound Score": st.column_config.NumberColumn("Score", format="%.2f"),
+            },
+            hide_index=True
         )
-        send_slack(alert_text)
-
-    send_slack(":dart: Sentiment analysis completed successfully!")
-    print("Done.")
-
-
-if __name__ == "__main__":
-    main()
+        
+        # Upload Results
+        with st.spinner("Uploading results to Google Sheets..."):
+            upload_results(sheet, results_df, SENTIMENT_RESULTS_TAB)
+            send_slack(f"📊 Sentiment Analysis complete for {len(results_df)} items.")
+            
+        st.success("✅ Analysis Complete & Uploaded!")

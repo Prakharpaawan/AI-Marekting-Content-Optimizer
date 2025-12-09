@@ -7,3 +7,4 @@ beautifulsoup4
 lxml
 praw
 python-dotenv
+huggingface_hub

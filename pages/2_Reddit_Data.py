@@ -1,19 +1,17 @@
 import streamlit as st
 import os
+import json
 import praw
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timezone
 
-# ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
+# ----- AUTHENTICATION SETUP -----
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
-    # 1. Try Streamlit Secrets (Cloud)
     if hasattr(st, "secrets") and key_name in st.secrets:
         return st.secrets[key_name]
-    
-    # 2. Try Local .env (Laptop)
     try:
         from dotenv import load_dotenv
         load_dotenv("secrettt.env")
@@ -22,24 +20,38 @@ def get_secret(key_name):
         return None
 
 def connect_sheets():
-    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
+    """Connect to Google Sheets (Works on Cloud & Local)"""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # A. Try Cloud Secrets (Streamlit)
-    if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    
-    # B. Try Local File (Laptop)
-    elif os.path.exists("credentials.json"):
-        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    # 1. Try Cloud Secrets (The "Nuclear" JSON Block)
+    if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
+        try:
+            creds_dict = json.loads(st.secrets["gcp_credentials"])
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            return client.open("Content Performance Tracker")
+        except Exception as e:
+            st.error(f"Secret Error: {e}")
+            st.stop()
+
+    # 2. Try Local File (Check Main Folder AND Parent Folder)
+    local_creds = None
+    if os.path.exists("credentials.json"):
+        local_creds = "credentials.json"
+    elif os.path.exists("../credentials.json"):
+        local_creds = "../credentials.json"
+
+    if local_creds:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(local_creds, scope)
+        client = gspread.authorize(creds)
+        return client.open("Content Performance Tracker")
     
     else:
-        st.error("❌ Critical Error: No Google Credentials found! Check Streamlit Secrets or credentials.json.")
+        st.error("❌ Critical Error: No Google Credentials found! Check 'credentials.json' locally or 'gcp_credentials' in Secrets.")
         st.stop()
-        
-    client = gspread.authorize(creds)
-    return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
 REDDIT_CLIENT_ID = get_secret("REDDIT_CLIENT_ID")
@@ -60,12 +72,13 @@ SUBREDDITS = [
     "PPC"
 ]
 
-# Reduced slightly for web performance, you can increase if needed
+# Reduced for web performance
 POST_LIMIT = 50 
 MIN_UPVOTES = 15
 MIN_COMMENTS = 3
 
 # ----- APP LOGIC -----
+@st.cache_data(show_spinner=False)
 def fetch_reddit_data():
     if not REDDIT_CLIENT_ID:
         st.error("❌ Reddit Keys Missing! Check your .env or Streamlit Secrets.")
@@ -118,8 +131,8 @@ def fetch_reddit_data():
                             "Score": comment.score,
                             "Comment URL": f"https://www.reddit.com{post.permalink}"
                         })
-                except Exception as e:
-                    pass # Skip comment errors
+                except Exception:
+                    pass 
 
         except Exception as e:
             st.warning(f"Error accessing r/{sub}: {e}")

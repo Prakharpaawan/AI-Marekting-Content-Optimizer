@@ -52,7 +52,6 @@ def connect_sheets():
 HF_TOKEN = get_secret("HF_TOKEN")
 SLACK_WEBHOOK = get_secret("SLACK_WEBHOOK_URL")
 
-# Tab names must match exactly what exists in your Sheet
 SOURCE_TAB = "Generated_Marketing_Content"
 OPTIMIZED_TAB = "Optimized_Content"
 
@@ -104,7 +103,7 @@ def optimize_content(text, tone, platform, keywords):
                     {"role": "system", "content": "You are an expert marketing copywriter."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=400, # Increased to prevent cutoff
+                max_tokens=500, 
                 temperature=0.7,
             )
             output = response.choices[0].message["content"].strip()
@@ -116,27 +115,37 @@ def optimize_content(text, tone, platform, keywords):
     return None, None, "All models failed."
 
 def parse_optimization_output(output):
-    """Extract optimized content, notes, and score."""
-    if not output: return "", "", ""
-    lines = output.split("\n")
-    # Simple parsing logic
+    """Robust Parser: Extracts content even if formatting is messy."""
+    if not output: return "N/A", "N/A", "N/A"
+    
     optimized = ""
     notes = ""
     score = ""
     
-    for line in lines:
+    parts = output.split('\n')
+    current_section = None
+    
+    for line in parts:
+        line = line.strip()
         if "Optimized Content:" in line:
-            optimized = line.replace("Optimized Content:", "").strip()
+            current_section = "optimized"
+            optimized += line.replace("Optimized Content:", "").strip() + " "
         elif "Improvement Notes:" in line:
-            notes = line.replace("Improvement Notes:", "").strip()
-        elif "Score" in line:
-            score = line.replace("Score", "").replace(":", "").replace("(out of 10)", "").strip()
+            current_section = "notes"
+            notes += line.replace("Improvement Notes:", "").strip() + " "
+        elif "Score" in line and "out of 10" in line:
+            current_section = "score"
+            score = line.replace("Score", "").replace("(out of 10)", "").replace(":", "").strip()
+        elif current_section == "optimized":
+            optimized += line + " "
+        elif current_section == "notes":
+            notes += line + " "
             
-    # Fallback if single line parsing failed (multi-line response)
-    if not optimized and len(lines) > 0:
-        optimized = lines[0] 
-
-    return optimized, notes, score
+    if not optimized.strip():
+        optimized = output 
+        notes = "Auto-parsed raw output"
+        
+    return optimized.strip(), notes.strip(), score.strip()
 
 def upload_optimized_results(records):
     sheet = connect_sheets()
@@ -145,7 +154,6 @@ def upload_optimized_results(records):
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title=OPTIMIZED_TAB, rows="1000", cols="20")
 
-    # Check if header exists
     if not ws.get_all_values():
         headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", 
                    "Original Content", "Optimized Content", "Improvement Notes", 
@@ -183,21 +191,15 @@ if st.button("🚀 Start Optimization Process", type="primary"):
         
         total = len(df)
         for idx, row in df.iterrows():
-            # 🟢 FIX: Updated column names to match Page 4 output exactly
-            text = row.get("Content", "") 
-            if not text: 
-                # Fallback for old data
-                text = row.get("Generated Content", "")
-            
+            text = row.get("Content", "") or row.get("Generated Content", "")
             if not text: continue
 
             status_text.write(f"Optimizing post {idx + 1}/{total}...")
             
-            # 🟢 FIX: Updated keys to match Page 4
-            tone = row.get("Tone", "neutral")
-            ctype = row.get("Content Type", "post")
-            keywords = row.get("Keywords", "")
-            product = row.get("Product Info", "")
+            tone = row.get("Tone", "") or row.get("Tone Requested", "neutral")
+            ctype = row.get("Content Type", "") or row.get("Content Type Requested", "post")
+            keywords = row.get("Keywords", "") or row.get("Keywords Used", "")
+            product = row.get("Product Info", "Unknown Product")
             
             output, model, error = optimize_content(text, tone, ctype, keywords)
             
@@ -221,10 +223,20 @@ if st.button("🚀 Start Optimization Process", type="primary"):
 
         status_text.success("✅ Optimization Complete!")
         
-        # Show Results
+        # Show Results - 🟢 UPDATED: Show ALL columns with improved width
         st.write("### Optimization Results")
         res_df = pd.DataFrame(optimized_records)
+        
         if not res_df.empty:
-            st.dataframe(res_df[["Original Content", "Optimized Content", "Optimization Score"]])
+            st.dataframe(
+                res_df,
+                column_config={
+                    "Original Content": st.column_config.TextColumn("Original", width="medium"),
+                    "Optimized Content": st.column_config.TextColumn("Optimized", width="large"),
+                    "Improvement Notes": st.column_config.TextColumn("Notes", width="medium"),
+                },
+                hide_index=True
+            )
+            
             upload_optimized_results(optimized_records)
             send_slack(f"🎯 Optimized {len(optimized_records)} posts successfully!")

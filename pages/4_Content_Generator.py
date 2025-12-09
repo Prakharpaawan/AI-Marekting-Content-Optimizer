@@ -97,7 +97,6 @@ def generate_marketing_content(product_info, content_type, tone, keywords):
                     {"role": "system", "content": "You are a creative AI marketing assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                # ⚡ INCREASED TOKENS HERE (was 200, now 800)
                 max_tokens=800,
                 temperature=0.7,
             )
@@ -116,10 +115,13 @@ def upload_generated_content(records):
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title=GENERATED_TAB_NAME, rows="1000", cols="20")
 
-    if not ws.get_all_values():
-        headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", "Model", "Content", "Error"]
-        ws.append_row(headers)
+    # 🟢 FIX: Clear the sheet first to remove redundant data
+    ws.clear()
 
+    # Define headers
+    headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", "Model", "Generated Content", "Error Message"]
+
+    # Prepare rows
     rows_to_add = []
     for r in records:
         rows_to_add.append([
@@ -128,8 +130,10 @@ def upload_generated_content(records):
             r["Generated Content"], r["Error Message"]
         ])
     
-    ws.append_rows(rows_to_add)
-    st.toast(f"Uploaded {len(records)} posts to Sheets!", icon="✅")
+    # Write Headers + New Data starting at A1 (Overwrites everything)
+    ws.update(values=[headers] + rows_to_add, range_name="A1")
+    
+    st.toast(f"Uploaded {len(records)} fresh posts (Sheet Cleared)!", icon="✅")
 
 # ----- STREAMLIT UI -----
 st.title("✍️ AI Content Generator")

@@ -9,17 +9,11 @@ from datetime import datetime
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 
-# ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
+# ----- AUTHENTICATION & SECRETS SETUP -----
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
-    # 1. Try Streamlit Secrets (Cloud)
-    try:
-        if hasattr(st, "secrets") and key_name in st.secrets:
-            return st.secrets[key_name]
-    except Exception:
-        pass 
-
-    # 2. Try Local .env (Laptop)
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
     try:
         load_dotenv("secrettt.env")
         return os.getenv(key_name)
@@ -58,8 +52,10 @@ def connect_sheets():
 HF_TOKEN = get_secret("HF_TOKEN")
 SLACK_WEBHOOK = get_secret("SLACK_WEBHOOK_URL")
 
+# Tab names must match exactly what exists in your Sheet
 SOURCE_TAB = "Generated_Marketing_Content"
 OPTIMIZED_TAB = "Optimized_Content"
+
 PRIMARY_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
 FALLBACK_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 
@@ -76,9 +72,10 @@ def load_generated_content():
     sheet = connect_sheets()
     try:
         ws = sheet.worksheet(SOURCE_TAB)
-        return pd.DataFrame(ws.get_all_records())
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
     except gspread.exceptions.WorksheetNotFound:
-        st.error(f"Tab '{SOURCE_TAB}' not found!")
+        st.error(f"Tab '{SOURCE_TAB}' not found! Run the Content Generator first.")
         return pd.DataFrame()
 
 def optimize_content(text, tone, platform, keywords):
@@ -107,7 +104,7 @@ def optimize_content(text, tone, platform, keywords):
                     {"role": "system", "content": "You are an expert marketing copywriter."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=300,
+                max_tokens=400, # Increased to prevent cutoff
                 temperature=0.7,
             )
             output = response.choices[0].message["content"].strip()
@@ -122,9 +119,23 @@ def parse_optimization_output(output):
     """Extract optimized content, notes, and score."""
     if not output: return "", "", ""
     lines = output.split("\n")
-    optimized = next((l.replace("Optimized Content:", "").strip() for l in lines if "Optimized Content:" in l), "")
-    notes = next((l.replace("Improvement Notes:", "").strip() for l in lines if "Improvement Notes:" in l), "")
-    score = next((l.replace("Score", "").replace(":", "").strip() for l in lines if "Score" in l), "")
+    # Simple parsing logic
+    optimized = ""
+    notes = ""
+    score = ""
+    
+    for line in lines:
+        if "Optimized Content:" in line:
+            optimized = line.replace("Optimized Content:", "").strip()
+        elif "Improvement Notes:" in line:
+            notes = line.replace("Improvement Notes:", "").strip()
+        elif "Score" in line:
+            score = line.replace("Score", "").replace(":", "").replace("(out of 10)", "").strip()
+            
+    # Fallback if single line parsing failed (multi-line response)
+    if not optimized and len(lines) > 0:
+        optimized = lines[0] 
+
     return optimized, notes, score
 
 def upload_optimized_results(records):
@@ -134,8 +145,11 @@ def upload_optimized_results(records):
     except gspread.exceptions.WorksheetNotFound:
         ws = sheet.add_worksheet(title=OPTIMIZED_TAB, rows="1000", cols="20")
 
+    # Check if header exists
     if not ws.get_all_values():
-        headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", "Original", "Optimized", "Notes", "Score", "Model", "Error"]
+        headers = ["Timestamp", "Product Info", "Content Type", "Tone", "Keywords", 
+                   "Original Content", "Optimized Content", "Improvement Notes", 
+                   "Optimization Score", "Model Used", "Error Message"]
         ws.append_row(headers)
 
     rows = []
@@ -169,26 +183,32 @@ if st.button("🚀 Start Optimization Process", type="primary"):
         
         total = len(df)
         for idx, row in df.iterrows():
-            text = row.get("Generated Content", "")
+            # 🟢 FIX: Updated column names to match Page 4 output exactly
+            text = row.get("Content", "") 
+            if not text: 
+                # Fallback for old data
+                text = row.get("Generated Content", "")
+            
             if not text: continue
 
             status_text.write(f"Optimizing post {idx + 1}/{total}...")
             
-            output, model, error = optimize_content(
-                text, 
-                row.get("Tone Requested", "neutral"),
-                row.get("Content Type Requested", "post"),
-                row.get("Keywords Used", "")
-            )
+            # 🟢 FIX: Updated keys to match Page 4
+            tone = row.get("Tone", "neutral")
+            ctype = row.get("Content Type", "post")
+            keywords = row.get("Keywords", "")
+            product = row.get("Product Info", "")
+            
+            output, model, error = optimize_content(text, tone, ctype, keywords)
             
             opt_text, notes, score = parse_optimization_output(output)
             
             optimized_records.append({
                 "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Product Info": row.get("Product Info", ""),
-                "Content Type Requested": row.get("Content Type Requested", ""),
-                "Tone Requested": row.get("Tone Requested", ""),
-                "Keywords Used": row.get("Keywords Used", ""),
+                "Product Info": product,
+                "Content Type Requested": ctype,
+                "Tone Requested": tone,
+                "Keywords Used": keywords,
                 "Original Content": text,
                 "Optimized Content": opt_text,
                 "Improvement Notes": notes,

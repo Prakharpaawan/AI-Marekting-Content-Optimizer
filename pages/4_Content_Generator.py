@@ -18,8 +18,14 @@ STOPWORDS = set(stopwords.words("english"))
 # ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
-    if hasattr(st, "secrets") and key_name in st.secrets:
-        return st.secrets[key_name]
+    # 1. Try Streamlit Secrets (Cloud)
+    try:
+        if hasattr(st, "secrets") and key_name in st.secrets:
+            return st.secrets[key_name]
+    except Exception:
+        pass 
+
+    # 2. Try Local .env (Laptop)
     try:
         from dotenv import load_dotenv
         load_dotenv("secrettt.env")
@@ -28,37 +34,32 @@ def get_secret(key_name):
         return None
 
 def connect_sheets():
-    """Connect to Google Sheets using Cloud Secrets (Nuclear Option) OR Local JSON"""
+    """Connect to Google Sheets using Cloud Secrets OR Local JSON (Robust Path Check)"""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # A. Try Cloud Secrets
-    if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
-        try:
+    # A. Try Cloud Secrets (Streamlit Cloud)
+    try:
+        if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
-            # Auto-repair private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             return client.open("Content Performance Tracker")
-        except Exception as e:
-            st.error(f"❌ JSON Error: {e}")
-            st.stop()
-            
-    # B. Try Local File
-    local_creds = None
-    if os.path.exists("credentials.json"):
-        local_creds = "credentials.json"
-    elif os.path.exists("../credentials.json"):
-        local_creds = "../credentials.json"
+    except Exception:
+        pass 
 
-    if local_creds:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(local_creds, scope)
-        client = gspread.authorize(creds)
-        return client.open("Content Performance Tracker")
+    # B. Try Local File (Laptop) - CHECK BOTH LOCATIONS
+    if os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    elif os.path.exists("../credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
-        st.error("❌ Critical Error: No Google Credentials found!")
+        st.error("❌ Critical Error: credentials.json not found in current or parent directory.")
         st.stop()
+        
+    client = gspread.authorize(creds)
+    return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
 HF_TOKEN = get_secret("HF_TOKEN")
@@ -170,32 +171,4 @@ if submitted:
                 
                 results.append({
                     "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Product Info": product_name,
-                    "Content Type Requested": ctype,
-                    "Tone Requested": tone,
-                    "Keywords Used": keywords,
-                    "Model Used": model,
-                    "Generated Content": content,
-                    "Error Message": err
-                })
-                
-                if content:
-                    # Send Slack Notification
-                    send_slack_message(f"✨ New {ctype} generated for {product_name}!")
-                
-                completed += 1
-        
-        status.update(label="✅ Generation Complete!", state="complete", expanded=False)
-        
-        # Display Results
-        for res in results:
-            with st.expander(f"{res['Tone Requested']} {res['Content Type Requested']}", expanded=True):
-                if res['Error Message']:
-                    st.error(res['Error Message'])
-                else:
-                    st.write(res['Generated Content'])
-                    st.caption(f"Model: {res['Model Used']}")
-        
-        # Upload
-        if results:
-            upload_generated_content(results)
+                    "Product Info":

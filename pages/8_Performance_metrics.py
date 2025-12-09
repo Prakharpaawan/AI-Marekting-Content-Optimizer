@@ -47,11 +47,11 @@ def connect_sheets():
     return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
-# These names must match your Google Sheet Tabs EXACTLY
+# Names must match your Sheet Tabs EXACTLY
 SENTIMENT_TAB = "Sentiment_Results_All"
 YOUTUBE_TAB = "YouTube Data"
-REDDIT_TAB = "Reddit Posts"  # Use 'Reddit Posts' to get raw upvotes/comments
-OUTPUT_TAB = "Content_Insights" # This is the summary tab you want
+REDDIT_TAB = "Reddit Posts"
+OUTPUT_TAB = "Content_Insights" # This is the summary tab
 
 # ----- HELPERS -----
 def safe_get_df(sheet, tab_name):
@@ -87,6 +87,7 @@ def calculate_metrics():
         df_yt["Comments"] = clean_numeric(df_yt, "Comments")
         
         # Engagement = (Likes + Comments) / Views * 100
+        # Avoid division by zero
         df_yt["Engagement"] = ((df_yt["Likes"] + df_yt["Comments"]) / df_yt["Views"].replace(0, 1)) * 100
         
         metrics["yt_avg_engagement"] = round(df_yt["Engagement"].mean(), 2)
@@ -98,9 +99,9 @@ def calculate_metrics():
         metrics["yt_avg_engagement"] = 0
         metrics["yt_top_content"] = "No Data"
 
-    # --- REDDIT METRICS (Fixed) ---
+    # --- REDDIT METRICS (Fixed "No Data") ---
     if not df_red.empty:
-        # Check if we have 'Upvotes' or 'Score' column (Reddit API varies)
+        # Check if column is 'Upvotes' or 'Score' (Reddit API uses both sometimes)
         upvote_col = "Upvotes" if "Upvotes" in df_red.columns else "Score"
         
         df_red[upvote_col] = clean_numeric(df_red, upvote_col)

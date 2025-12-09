@@ -27,13 +27,13 @@ def connect_sheets():
     except Exception:
         pass 
 
-    # B. Try Local File (Laptop)
+    # B. Try Local File (Laptop) - CHECK BOTH LOCATIONS
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
-        st.error("❌ Critical Error: No Google Credentials found! Check Secrets or credentials.json.")
+        st.error("❌ Critical Error: credentials.json not found in current or parent directory.")
         st.stop()
         
     client = gspread.authorize(creds)

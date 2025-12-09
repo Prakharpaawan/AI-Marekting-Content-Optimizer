@@ -160,23 +160,27 @@ def run_prediction_coach():
             rec_variant = "A (Original)"
             rec_platform = best_plat_a
             final_text = a_text
+            final_score = best_score_a
         else:
             rec_variant = "B (AI)"
             rec_platform = best_plat_b
             final_text = b_text
+            final_score = best_score_b
             
         post_time = suggest_posting_time(rec_platform)
-        reason = f"Variant {rec_variant} is predicted to perform best on {rec_platform}."
+        reason = f"Variant {rec_variant} wins (A={best_score_a}, B={best_score_b}) on {rec_platform}"
 
         results.append({
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Product": row.get("Product Info", "") or row.get("Product", ""),
             "Winner": rec_variant,
             "Best Platform": rec_platform,
-            "Viral Score": max(best_score_a, best_score_b),
+            "Viral Score": final_score,
             "Recommended Time": post_time,
             "Winning Text": final_text,
-            "Reason": reason
+            "Recommendation_Reason": reason,
+            "Score_A_Predicted": best_score_a,
+            "Score_B_Predicted": best_score_b
         })
         
         progress_bar.progress((idx + 1) / total)
@@ -216,11 +220,17 @@ if st.button("🚀 Run Prediction Analysis", type="primary"):
         
         st.write("### 📢 Strategy Recommendations")
         
+        # 🟢 RESTORED: Full Detailed Table
         st.dataframe(
-            results_df[["Product", "Winner", "Best Platform", "Recommended Time", "Viral Score", "Winning Text"]],
+            results_df[[
+                "Product", "Winner", "Best Platform", "Recommended Time", 
+                "Viral Score", "Score_A_Predicted", "Score_B_Predicted", 
+                "Recommendation_Reason", "Winning Text"
+            ]],
             column_config={
-                "Winning Text": st.column_config.TextColumn("Content", width="large"),
+                "Winning Text": st.column_config.TextColumn("Content", width="medium"),
                 "Viral Score": st.column_config.ProgressColumn("Viral Potential", min_value=0, max_value=1),
+                "Recommendation_Reason": st.column_config.TextColumn("Why?", width="medium"),
             },
             hide_index=True
         )

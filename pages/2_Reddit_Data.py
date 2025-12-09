@@ -1,24 +1,52 @@
+import streamlit as st
 import os
-
 import praw
 import pandas as pd
 import gspread
-from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timezone
 
-load_dotenv("secrettt.env")
+# ----- AUTHENTICATION & SECRETS SETUP (Universal Fix) -----
+def get_secret(key_name):
+    """Fetch secret from Streamlit Cloud OR Local .env file"""
+    # 1. Try Streamlit Secrets (Cloud)
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
+    
+    # 2. Try Local .env (Laptop)
+    try:
+        from dotenv import load_dotenv
+        load_dotenv("secrettt.env")
+        return os.getenv(key_name)
+    except ImportError:
+        return None
 
-# ===========================
-# CONFIGURATION
-# ===========================
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
-REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT")
+def connect_sheets():
+    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
+    # A. Try Cloud Secrets (Streamlit)
+    if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    
+    # B. Try Local File (Laptop)
+    elif os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    
+    else:
+        st.error("❌ Critical Error: No Google Credentials found! Check Streamlit Secrets or credentials.json.")
+        st.stop()
+        
+    client = gspread.authorize(creds)
+    return client.open("Content Performance Tracker")
+
+# ----- CONFIG -----
+REDDIT_CLIENT_ID = get_secret("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = get_secret("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT = get_secret("REDDIT_USER_AGENT")
 
 GOOGLE_SHEET_NAME = "Content Performance Tracker"
-CREDENTIALS_FILE = "credentials.json"
-
 POSTS_TAB = "Reddit Posts"
 COMMENTS_TAB = "Reddit Comments"
 
@@ -32,16 +60,16 @@ SUBREDDITS = [
     "PPC"
 ]
 
-POST_LIMIT = 100
+# Reduced slightly for web performance, you can increase if needed
+POST_LIMIT = 50 
 MIN_UPVOTES = 15
 MIN_COMMENTS = 3
 
-
-# ===========================
-# FETCH REDDIT POSTS
-# ===========================
-def fetch_reddit_posts():
-    print("Connecting to Reddit API...")
+# ----- APP LOGIC -----
+def fetch_reddit_data():
+    if not REDDIT_CLIENT_ID:
+        st.error("❌ Reddit Keys Missing! Check your .env or Streamlit Secrets.")
+        return pd.DataFrame(), pd.DataFrame()
 
     reddit = praw.Reddit(
         client_id=REDDIT_CLIENT_ID,
@@ -50,82 +78,60 @@ def fetch_reddit_posts():
     )
 
     all_posts = []
-
-    for sub in SUBREDDITS:
-        print(f"Fetching posts from r/{sub}...")
-        subreddit = reddit.subreddit(sub)
-
-        for post in subreddit.hot(limit=POST_LIMIT):
-
-            if post.score < MIN_UPVOTES or post.num_comments < MIN_COMMENTS:
-                continue
-
-            all_posts.append({
-                "Subreddit": sub,
-                "Title": post.title,
-                "Upvotes": post.score,
-                "Comments": post.num_comments,
-                "URL": f"https://www.reddit.com{post.permalink}",
-                "Created Date": datetime.fromtimestamp(post.created_utc, timezone.utc).strftime("%Y-%m-%d"),
-                "Post Text": post.selftext[:500] + "..." if post.selftext else "N/A (Link Post)",
-                "Post ID": post.id
-            })
-
-    print(f"Collected {len(all_posts)} posts.\n")
-    return pd.DataFrame(all_posts)
-
-
-# ===========================
-# FETCH COMMENTS FOR EACH POST
-# ===========================
-def fetch_comments_for_posts(df_posts):
-    print("Fetching comments for posts...")
-
-    reddit = praw.Reddit(
-        client_id=REDDIT_CLIENT_ID,
-        client_secret=REDDIT_CLIENT_SECRET,
-        user_agent=REDDIT_USER_AGENT,
-    )
-
     all_comments = []
+    
+    # UI Progress components
+    status_text = st.empty()
+    progress_bar = st.progress(0)
 
-    for _, row in df_posts.iterrows():
-        post_id = row["Post ID"]
-        post_url = row["URL"]
+    total_steps = len(SUBREDDITS)
 
+    for idx, sub in enumerate(SUBREDDITS):
+        status_text.write(f"🔎 Scraping r/{sub}...")
+        
         try:
-            submission = reddit.submission(url=post_url)
-            submission.comments.replace_more(limit=0)
+            subreddit = reddit.subreddit(sub)
+            # Fetch Posts
+            for post in subreddit.hot(limit=POST_LIMIT):
+                if post.score < MIN_UPVOTES or post.num_comments < MIN_COMMENTS:
+                    continue
 
-            for comment in submission.comments:
-                all_comments.append({
-                    "Post ID": post_id,
-                    "Comment Text": comment.body[:300],
-                    "Score": comment.score,
-                    "Comment URL": post_url
-                })
+                post_data = {
+                    "Subreddit": sub,
+                    "Title": post.title,
+                    "Upvotes": post.score,
+                    "Comments": post.num_comments,
+                    "URL": f"https://www.reddit.com{post.permalink}",
+                    "Created Date": datetime.fromtimestamp(post.created_utc, timezone.utc).strftime("%Y-%m-%d"),
+                    "Post Text": post.selftext[:500] + "..." if post.selftext else "N/A (Link Post)",
+                    "Post ID": post.id
+                }
+                all_posts.append(post_data)
+
+                # Fetch Comments (Only top level to save time)
+                try:
+                    post.comments.replace_more(limit=0)
+                    for comment in post.comments[:5]: # Grab top 5 comments per post
+                        all_comments.append({
+                            "Post ID": post.id,
+                            "Comment Text": comment.body[:300],
+                            "Score": comment.score,
+                            "Comment URL": f"https://www.reddit.com{post.permalink}"
+                        })
+                except Exception as e:
+                    pass # Skip comment errors
 
         except Exception as e:
-            print(f"Error fetching comments for {post_url}: {e}")
+            st.warning(f"Error accessing r/{sub}: {e}")
+        
+        # Update progress
+        progress_bar.progress((idx + 1) / total_steps)
 
-    print(f"Collected {len(all_comments)} comments.\n")
-    return pd.DataFrame(all_comments)
+    status_text.success("✅ Reddit Scraping Complete!")
+    return pd.DataFrame(all_posts), pd.DataFrame(all_comments)
 
-
-# ===========================
-# UPLOAD TO GOOGLE SHEETS
-# ===========================
-def upload_to_google_sheets(posts_df, comments_df):
-    print("Uploading Reddit posts + comments to Google Sheets...")
-
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
-    client = gspread.authorize(creds)
-
-    sheet = client.open(GOOGLE_SHEET_NAME)
+def upload_to_sheets(posts_df, comments_df):
+    sheet = connect_sheets()
 
     # ---------- Posts Tab ----------
     try:
@@ -133,8 +139,9 @@ def upload_to_google_sheets(posts_df, comments_df):
     except gspread.exceptions.WorksheetNotFound:
         ws_posts = sheet.add_worksheet(title=POSTS_TAB, rows="2000", cols="20")
 
-    ws_posts.clear()
-    ws_posts.update("A1", [posts_df.columns.tolist()] + posts_df.values.tolist())
+    if not posts_df.empty:
+        ws_posts.clear()
+        ws_posts.update("A1", [posts_df.columns.tolist()] + posts_df.astype(str).values.tolist())
 
     # ---------- Comments Tab ----------
     try:
@@ -142,25 +149,31 @@ def upload_to_google_sheets(posts_df, comments_df):
     except gspread.exceptions.WorksheetNotFound:
         ws_comments = sheet.add_worksheet(title=COMMENTS_TAB, rows="3000", cols="20")
 
-    ws_comments.clear()
-    ws_comments.update("A1", [comments_df.columns.tolist()] + comments_df.values.tolist())
+    if not comments_df.empty:
+        ws_comments.clear()
+        ws_comments.update("A1", [comments_df.columns.tolist()] + comments_df.astype(str).values.tolist())
 
-    print("Upload complete!")
+    st.toast("Uploaded to Google Sheets successfully!", icon="🚀")
 
+# ----- STREAMLIT UI -----
+st.title("💬 Reddit Trend Monitor")
+st.markdown("Monitor discussions across top marketing subreddits to identify audience pain points.")
 
-# ===========================
-# MAIN
-# ===========================
-if __name__ == "__main__":
-
-    posts_df = fetch_reddit_posts()
-
-    if posts_df.empty:
-        print("No Reddit posts found. Exiting.")
-        exit()
-
-    comments_df = fetch_comments_for_posts(posts_df)
-
-    upload_to_google_sheets(posts_df, comments_df)
-
-    print("\nReddit data collection completed successfully!")
+col1, col2 = st.columns(2)
+with col1:
+    st.info(f"**Subreddits:** {', '.join(SUBREDDITS)}")
+with col2:
+    if st.button("🚀 Start Scraping Reddit", type="primary"):
+        with st.spinner("Connecting to Reddit API..."):
+            posts_df, comments_df = fetch_reddit_data()
+            
+            if not posts_df.empty:
+                st.write(f"### 📝 Found {len(posts_df)} Posts")
+                st.dataframe(posts_df.head(10))
+                
+                st.write(f"### 🗣️ Found {len(comments_df)} Comments")
+                st.dataframe(comments_df.head(10))
+                
+                upload_to_sheets(posts_df, comments_df)
+            else:
+                st.warning("No posts found matching criteria.")

@@ -1,59 +1,74 @@
-# prediction_coach.py
-"""
-Prediction Coach
-- Reads AB_Testing tab (created by ab_testing.py)
-- Runs platform simulations and computes predicted viral score
-- Writes results to Prediction_Coach tab and sends Slack summary
-"""
-
+import streamlit as st
 import os
+import json
 import time
 from datetime import datetime
 import pandas as pd
 import gspread
-from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
 import requests
+from dotenv import load_dotenv
 
-load_dotenv("secrettt.env")
-
-# CONFIG
-GOOGLE_SHEET_NAME = "Content Performance Tracker"
-CREDENTIALS_FILE = "credentials.json"
-AB_TAB = "AB_Testing"
-OUTPUT_TAB = "Prediction_Coach"
-
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
-
-PLATFORMS = ["Twitter", "Instagram", "LinkedIn", "YouTube"]
-
-
-def send_slack(text):
+# ----- AUTHENTICATION SETUP -----
+def get_secret(key_name):
+    """Fetch secret from Streamlit Cloud OR Local .env file"""
+    if hasattr(st, "secrets") and key_name in st.secrets:
+        return st.secrets[key_name]
     try:
-        requests.post(SLACK_WEBHOOK, json={"text": text})
-    except:
-        pass
-
-
-def connect_to_sheets():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(
-        CREDENTIALS_FILE, scope)
-    client = gspread.authorize(creds)
-    return client.open(GOOGLE_SHEET_NAME)
-
-
-def safe_get(ws, name):
-    try:
-        return ws.worksheet(name)
-    except:
+        load_dotenv("secrettt.env")
+        return os.getenv(key_name)
+    except ImportError:
         return None
 
+def connect_sheets():
+    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
+    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    
+    # A. Try Cloud Secrets
+    try:
+        if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
+            creds_dict = json.loads(st.secrets["gcp_credentials"])
+            if "private_key" in creds_dict:
+                creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+            client = gspread.authorize(creds)
+            return client.open("Content Performance Tracker")
+    except Exception:
+        pass
 
-#  PLATFORM SIMULATION 
+    # B. Try Local File
+    if os.path.exists("credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    elif os.path.exists("../credentials.json"):
+        creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
+    else:
+        st.error("❌ Critical Error: No Google Credentials found!")
+        st.stop()
+        
+    client = gspread.authorize(creds)
+    return client.open("Content Performance Tracker")
+
+# ----- CONFIG -----
+SLACK_WEBHOOK = get_secret("SLACK_WEBHOOK_URL")
+AB_TAB = "AB_Testing"
+OUTPUT_TAB = "Prediction_Coach"
+PLATFORMS = ["Twitter", "Instagram", "LinkedIn", "YouTube"]
+
+# ----- HELPERS -----
+def send_slack(text):
+    if not SLACK_WEBHOOK: return
+    try:
+        requests.post(SLACK_WEBHOOK, json={"text": text})
+    except Exception:
+        pass
+
+def safe_get_worksheet(sheet, tab_name):
+    try:
+        return sheet.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return None
+
+# ----- PREDICTION LOGIC -----
 def platform_modifier(text, platform):
     text_l = (text or "").lower()
     length = len(text_l.split())
@@ -61,59 +76,37 @@ def platform_modifier(text, platform):
 
     # Twitter rules
     if platform == "Twitter":
-        if length <= 30:
-            mod += 0.08
-        if "#" in text_l or "trending" in text_l:
-            mod += 0.05
-        if "!" in text_l:
-            mod += 0.02
+        if length <= 30: mod += 0.08
+        if "#" in text_l or "trending" in text_l: mod += 0.05
+        if "!" in text_l: mod += 0.02
+        if length > 50: mod -= 0.05
 
     # Instagram rules
     if platform == "Instagram":
-        if 8 <= length <= 60:
-            mod += 0.07
-        if "#" in text_l:
-            mod += 0.07
-        if any(w in text_l for w in ["amazing", "fun", "love", "cute"]):
-            mod += 0.04
+        if 8 <= length <= 60: mod += 0.07
+        if "#" in text_l: mod += 0.07
+        if any(w in text_l for w in ["amazing", "fun", "love", "cute"]): mod += 0.04
 
     # LinkedIn rules    
     if platform == "LinkedIn":
-        if length >= 20:
-            mod += 0.08
-        if any(w in text_l for w in ["insight", "data", "strategy", "productivity", "growth"]):
-            mod += 0.06
+        if length >= 20: mod += 0.08
+        if any(w in text_l for w in ["insight", "data", "strategy", "growth"]): mod += 0.06
+        if length < 10: mod -= 0.03
 
     # YouTube rules
     if platform == "YouTube":
-        if length >= 40:
-            mod += 0.07
-        if any(w in text_l for w in ["how to", "tutorial", "guide", "watch"]):
-            mod += 0.05
-
-    # penalties
-    if platform == "Twitter" and length > 50:
-        mod -= 0.05
-    if platform == "LinkedIn" and length < 10:
-        mod -= 0.03
+        if length >= 40: mod += 0.07
+        if any(w in text_l for w in ["how to", "tutorial", "guide", "watch"]): mod += 0.05
 
     return round(mod, 3)
 
-
-#  POSTING TIME 
 def suggest_posting_time(platform):
-    if platform == "Twitter":
-        return "5-8 PM (weekday evenings)"
-    if platform == "Instagram":
-        return "6-9 PM (weekday evenings)"
-    if platform == "LinkedIn":
-        return "8-10 AM (weekday mornings)"
-    if platform == "YouTube":
-        return "5-8 PM (weekend evenings)"
+    if platform == "Twitter": return "5-8 PM (Weekdays)"
+    if platform == "Instagram": return "6-9 PM (Weekdays)"
+    if platform == "LinkedIn": return "8-10 AM (Mornings)"
+    if platform == "YouTube": return "5-8 PM (Weekends)"
     return "Anytime"
 
-
-#  VIRAL PREDICTION 
 def compute_viral_prediction(base_score, text):
     platform_scores = {}
     for p in PLATFORMS:
@@ -125,92 +118,112 @@ def compute_viral_prediction(base_score, text):
     best_platform = max(platform_scores, key=lambda k: platform_scores[k])
     return platform_scores, best_platform
 
+# ----- MAIN LOGIC -----
+def run_prediction_coach():
+    sheet = connect_sheets()
+    ws = safe_get_worksheet(sheet, AB_TAB)
+    
+    if not ws:
+        st.error(f"Tab '{AB_TAB}' not found. Run A/B Testing first.")
+        return pd.DataFrame()
 
-#  MAIN 
-def main():
-    send_slack(":rocket: Prediction Coach starting...")
+    df_ab = pd.DataFrame(ws.get_all_records())
+    if df_ab.empty:
+        st.warning("No A/B test data found.")
+        return pd.DataFrame()
 
-    try:
-        sheet = connect_to_sheets()
-    except Exception as e:
-        send_slack(f":x: Error connecting to Google Sheets: {e}")
-        return
+    results = []
+    progress_bar = st.progress(0)
+    total = len(df_ab)
 
-    ab_ws = safe_get(sheet, AB_TAB)
-    if ab_ws is None:
-        send_slack(":warning: AB_Testing tab missing.")
-        return
-
-    rows = ab_ws.get_all_records()
-    if not rows:
-        send_slack(":warning: AB_Testing tab is empty.")
-        return
-
-    df_ab = pd.DataFrame(rows)
-    output_rows = []
-
-    for _, row in df_ab.iterrows():
-        a_text = row.get("A_Text", "")
-        b_text = row.get("B_Text", "")
-        score_a = float(row["Score A"])
-        score_b = float(row["Score B"])
+    for idx, row in df_ab.iterrows():
+        a_text = row.get("A_Text", "") or row.get("Variant A (Original)", "")
+        b_text = row.get("B_Text", "") or row.get("Variant B (AI)", "")
+        
+        # Safely convert scores
+        try:
+            score_a = float(row.get("Score A", 0))
+            score_b = float(row.get("Score B", 0))
+        except ValueError:
+            score_a = 0.5
+            score_b = 0.5
 
         # Viral predictions
-        platform_scores_a, best_platform_a = compute_viral_prediction(score_a, a_text)
-        platform_scores_b, best_platform_b = compute_viral_prediction(score_b, b_text)
+        p_scores_a, best_plat_a = compute_viral_prediction(score_a, a_text)
+        p_scores_b, best_plat_b = compute_viral_prediction(score_b, b_text)
 
-        best_score_a = platform_scores_a[best_platform_a]
-        best_score_b = platform_scores_b[best_platform_b]
+        best_score_a = p_scores_a[best_plat_a]
+        best_score_b = p_scores_b[best_plat_b]
 
         # Choose winner
-        recommended_variant = "A" if best_score_a >= best_score_b else "B"
-        recommended_platform = best_platform_a if recommended_variant == "A" else best_platform_b
-        posting_time = suggest_posting_time(recommended_platform)
+        if best_score_a >= best_score_b:
+            rec_variant = "A (Original)"
+            rec_platform = best_plat_a
+            final_text = a_text
+        else:
+            rec_variant = "B (AI)"
+            rec_platform = best_plat_b
+            final_text = b_text
+            
+        post_time = suggest_posting_time(rec_platform)
+        reason = f"Variant {rec_variant} is predicted to perform best on {rec_platform}."
 
-        reason = f"Variant {recommended_variant} wins (A={best_score_a}, B={best_score_b}) on {recommended_platform}"
-
-        output_rows.append({
+        results.append({
             "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Product Info": row.get("Product Info", ""),
-            "Content Type": row.get("Content Type", ""),
-            "Tone": row.get("Tone", ""),
-            "A_Text": a_text,
-            "B_Text": b_text,
-            "Score_A": score_a,
-            "Score_B": score_b,
-            "Best_Platform_A": best_platform_a,
-            "Best_Platform_A_Score": best_score_a,
-            "Best_Platform_B": best_platform_b,
-            "Best_Platform_B_Score": best_score_b,
-            "Recommended_Variant": recommended_variant,
-            "Recommended_Platform": recommended_platform,
-            "Recommended_Posting_Time": posting_time,
-            "Recommendation_Reason": reason
+            "Product": row.get("Product Info", "") or row.get("Product", ""),
+            "Winner": rec_variant,
+            "Best Platform": rec_platform,
+            "Viral Score": max(best_score_a, best_score_b),
+            "Recommended Time": post_time,
+            "Winning Text": final_text,
+            "Reason": reason
         })
+        
+        progress_bar.progress((idx + 1) / total)
 
-        # Slack update
-        send_slack(
-            f":mag: Prediction Result\n"
-            f"Recommended Variant: {recommended_variant}\n"
-            f"Platform: {recommended_platform}\n"
-            f"Posting Time: {posting_time}\n"
-            f"Reason: {reason}"
-        )
+    return pd.DataFrame(results)
 
-    # Upload result
+def upload_predictions(sheet, df):
     try:
-        ws = sheet.worksheet(OUTPUT_TAB)
-        ws.clear()
-    except:
-        ws = sheet.add_worksheet(OUTPUT_TAB, rows=2000, cols=20)
+        try:
+            ws = sheet.worksheet(OUTPUT_TAB)
+            ws.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=OUTPUT_TAB, rows="1000", cols="20")
+        
+        ws.update(values=[df.columns.tolist()] + df.astype(str).values.tolist(), range_name="A1")
+        st.toast("Predictions uploaded to Google Sheets!", icon="🚀")
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
 
-    df_out = pd.DataFrame(output_rows)
-    headers = df_out.columns.tolist()
-    values = [headers] + df_out.fillna("").values.tolist()
-    ws.update("A1", values)
+# ----- STREAMLIT UI -----
+st.title("🔮 Prediction Coach")
+st.markdown("AI-driven advice on where and when to post your winning content.")
 
-    send_slack(":white_check_mark: Prediction Coach completed.")
-
-
-if __name__ == "__main__":
-    main()
+if st.button("🚀 Run Prediction Analysis", type="primary"):
+    with st.spinner("Analyzing viral potential..."):
+        sheet = connect_sheets()
+        results_df = run_prediction_coach()
+    
+    if not results_df.empty:
+        # Metrics
+        avg_viral = results_df["Viral Score"].mean()
+        top_platform = results_df["Best Platform"].mode()[0]
+        
+        col1, col2 = st.columns(2)
+        col1.metric("Avg Viral Potential", f"{avg_viral:.2f}/1.0")
+        col2.metric("Top Recommended Platform", top_platform)
+        
+        st.write("### 📢 Strategy Recommendations")
+        
+        st.dataframe(
+            results_df[["Product", "Winner", "Best Platform", "Recommended Time", "Viral Score", "Winning Text"]],
+            column_config={
+                "Winning Text": st.column_config.TextColumn("Content", width="large"),
+                "Viral Score": st.column_config.ProgressColumn("Viral Potential", min_value=0, max_value=1),
+            },
+            hide_index=True
+        )
+        
+        upload_predictions(sheet, results_df)
+        send_slack(f"🔮 Prediction Coach finished. Top platform: {top_platform}")

@@ -1,0 +1,8 @@
+google-api-python-client
+gspread
+oauth2client
+pandas
+requests
+beautifulsoup4
+lxml
+praw

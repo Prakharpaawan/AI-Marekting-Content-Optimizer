@@ -220,12 +220,14 @@ if st.button("🚀 Run Prediction Analysis", type="primary"):
         
         st.write("### 📢 Strategy Recommendations")
         
-        # 🟢 RESTORED: Full Detailed Table
+        # 🟢 UPDATED: Score A and Score B are now shown BEFORE the Winner
         st.dataframe(
             results_df[[
-                "Product", "Winner", "Best Platform", "Recommended Time", 
-                "Viral Score", "Score_A_Predicted", "Score_B_Predicted", 
-                "Recommendation_Reason", "Winning Text"
+                "Product", 
+                "Score_A_Predicted", "Score_B_Predicted", 
+                "Winner", "Best Platform", "Recommended Time", 
+                "Viral Score", 
+                "Winning Text", "Recommendation_Reason"
             ]],
             column_config={
                 "Winning Text": st.column_config.TextColumn("Content", width="medium"),

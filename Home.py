@@ -9,7 +9,7 @@ st.set_page_config(
 
 # --- HEADER SECTION ---
 st.title("AI-Based Automated Content Marketing Optimizer")
-st.markdown("**Project By:** Prakhar Paawan | **Status:** Active System")
+st.markdown("**Status:** Active System")
 st.divider()
 
 # --- PROJECT STATEMENT ---
@@ -90,3 +90,4 @@ if "gcp_credentials" in st.secrets or os.path.exists("credentials.json"):
     st.success("System Connection: Google Cloud Services Connected")
 else:
     st.error("System Connection: Credentials Missing")
+

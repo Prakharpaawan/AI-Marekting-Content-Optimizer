@@ -8,6 +8,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # ----- AUTHENTICATION SETUP -----
+
+# This function is used to get secret values like API keys.
+# It first checks Streamlit Cloud secrets.
+# If not found, it loads values from a local .env file.
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
     if hasattr(st, "secrets") and key_name in st.secrets:
@@ -18,28 +22,34 @@ def get_secret(key_name):
     except ImportError:
         return None
 
+# This function connects the app to Google Sheets.
+# It works both on Streamlit Cloud and on a local system.
 def connect_sheets():
     """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # A. Try Cloud Secrets
+    # First try to load Google credentials from Streamlit Cloud secrets
     try:
         if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
+            
+            # Fix formatting issue in private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             return client.open("Content Performance Tracker")
     except Exception:
         pass
 
-    # B. Try Local File
+    # If cloud secrets are not available, try local credentials.json
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
+        # Stop the app if Google credentials are missing
         st.error("❌ Critical Error: No Google Credentials found!")
         st.stop()
         
@@ -47,13 +57,16 @@ def connect_sheets():
     return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
-# Names must match your Sheet Tabs EXACTLY
+
+# Sheet tab names (must match Google Sheets exactly)
 SENTIMENT_TAB = "Sentiment_Results_All"
 YOUTUBE_TAB = "YouTube Data"
 REDDIT_TAB = "Reddit Posts"
-OUTPUT_TAB = "Content_Insights" # This is the summary tab
+OUTPUT_TAB = "Content_Insights"  # Final summary tab
 
 # ----- HELPERS -----
+
+# This function safely loads a Google Sheet tab into a DataFrame
 def safe_get_df(sheet, tab_name):
     """Safely load a worksheet into a Pandas DataFrame."""
     try:
@@ -63,6 +76,7 @@ def safe_get_df(sheet, tab_name):
     except gspread.exceptions.WorksheetNotFound:
         return pd.DataFrame()
 
+# This function safely converts columns to numeric values
 def clean_numeric(df, col):
     """Safely convert a column to numeric, replacing errors with 0."""
     if col in df.columns:
@@ -70,10 +84,12 @@ def clean_numeric(df, col):
     return 0
 
 # ----- CALCULATION LOGIC -----
+
+# This function calculates engagement and sentiment metrics
 def calculate_metrics():
     sheet = connect_sheets()
     
-    # 1. Load All Data Sources
+    # Load all required data sources
     df_sent = safe_get_df(sheet, SENTIMENT_TAB)
     df_yt = safe_get_df(sheet, YOUTUBE_TAB)
     df_red = safe_get_df(sheet, REDDIT_TAB)
@@ -86,33 +102,33 @@ def calculate_metrics():
         df_yt["Likes"] = clean_numeric(df_yt, "Likes")
         df_yt["Comments"] = clean_numeric(df_yt, "Comments")
         
-        # Engagement = (Likes + Comments) / Views * 100
-        # Avoid division by zero
+        # Engagement formula: (Likes + Comments) / Views * 100
+        # Replace 0 views with 1 to avoid division error
         df_yt["Engagement"] = ((df_yt["Likes"] + df_yt["Comments"]) / df_yt["Views"].replace(0, 1)) * 100
         
         metrics["yt_avg_engagement"] = round(df_yt["Engagement"].mean(), 2)
         
-        # Top Video
+        # Find top video based on views
         top_vid = df_yt.sort_values(by="Views", ascending=False).iloc[0]
         metrics["yt_top_content"] = f"{top_vid.get('Video Title', 'Unknown')} ({top_vid.get('Views')} views)"
     else:
         metrics["yt_avg_engagement"] = 0
         metrics["yt_top_content"] = "No Data"
 
-    # --- REDDIT METRICS (Fixed "No Data") ---
+    # --- REDDIT METRICS ---
     if not df_red.empty:
-        # Check if column is 'Upvotes' or 'Score' (Reddit API uses both sometimes)
+        # Reddit sometimes uses 'Upvotes' or 'Score'
         upvote_col = "Upvotes" if "Upvotes" in df_red.columns else "Score"
         
         df_red[upvote_col] = clean_numeric(df_red, upvote_col)
         df_red["Comments"] = clean_numeric(df_red, "Comments")
         
-        # Engagement score = Upvotes + Comments
+        # Engagement score for Reddit
         df_red["Engagement"] = df_red[upvote_col] + df_red["Comments"]
         
         metrics["red_avg_engagement"] = round(df_red["Engagement"].mean(), 2)
         
-        # Top Post
+        # Find top Reddit post
         top_post = df_red.sort_values(by=upvote_col, ascending=False).iloc[0]
         metrics["red_top_content"] = f"{top_post.get('Title', 'Unknown')} ({top_post.get(upvote_col)} upvotes)"
     else:
@@ -128,6 +144,7 @@ def calculate_metrics():
         
         metrics["avg_sentiment"] = round(df_sent[score_col].mean(), 3)
         
+        # Calculate sentiment percentages
         if label_col in df_sent.columns:
             metrics["pos_pct"] = round((df_sent[label_col].str.lower() == "positive").mean() * 100, 1)
             metrics["neg_pct"] = round((df_sent[label_col].str.lower() == "negative").mean() * 100, 1)
@@ -147,6 +164,7 @@ def calculate_metrics():
 
     return metrics, sheet
 
+# This function uploads the final summary metrics to Google Sheets
 def upload_insights(sheet, metrics):
     """Uploads the summary table to the 'Content_Insights' tab."""
     data = [
@@ -176,15 +194,18 @@ def upload_insights(sheet, metrics):
         st.error(f"Upload failed: {e}")
 
 # ----- STREAMLIT UI -----
+
+# App title and short description
 st.title("📈 Content Performance & Insights")
 st.markdown("Aggregated metrics from YouTube, Reddit, and Sentiment Analysis.")
 
+# Button to generate the performance report
 if st.button("🚀 Generate Performance Report", type="primary"):
     with st.spinner("Calculating metrics across all platforms..."):
         metrics, sheet = calculate_metrics()
     
     if metrics:
-        # Top Level Metrics
+        # Show main metrics at the top
         col1, col2, col3 = st.columns(3)
         col1.metric("Avg Sentiment", metrics["avg_sentiment"])
         col2.metric("YouTube Engagement", f"{metrics['yt_avg_engagement']}%")
@@ -192,19 +213,20 @@ if st.button("🚀 Generate Performance Report", type="primary"):
 
         st.divider()
 
-        # Detailed Tables
+        # Show top performing content
         st.subheader("🏆 Top Performing Content")
         st.info(f"**YouTube:** {metrics['yt_top_content']}")
         st.success(f"**Reddit:** {metrics['red_top_content']}")
 
         st.divider()
+
+        # Show sentiment breakdown
         st.subheader("📊 Sentiment Breakdown")
         c1, c2, c3 = st.columns(3)
         c1.metric("Positive", f"{metrics['pos_pct']}%")
         c2.metric("Negative", f"{metrics['neg_pct']}%")
         c3.metric("Neutral", f"{metrics['neu_pct']}%")
 
-        # Upload
+        # Upload summary to Google Sheets
         if sheet:
             upload_insights(sheet, metrics)
-

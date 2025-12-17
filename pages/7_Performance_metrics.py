@@ -207,3 +207,4 @@ if st.button("🚀 Generate Performance Report", type="primary"):
         # Upload
         if sheet:
             upload_insights(sheet, metrics)
+

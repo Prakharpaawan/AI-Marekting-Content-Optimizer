@@ -12,12 +12,19 @@ from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 
 # ----- NLTK SETUP -----
+
+# Check if VADER sentiment lexicon is already available
+# If not found, download it automatically
 try:
     nltk.data.find('sentiment/vader_lexicon.zip')
 except LookupError:
     nltk.download('vader_lexicon')
 
 # ----- AUTHENTICATION SETUP -----
+
+# This function is used to fetch secret values like API keys.
+# It first checks Streamlit Cloud secrets.
+# If not found, it loads values from a local .env file.
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
     if hasattr(st, "secrets") and key_name in st.secrets:
@@ -28,28 +35,34 @@ def get_secret(key_name):
     except ImportError:
         return None
 
+# This function connects the app to Google Sheets.
+# It works both on Streamlit Cloud and on a local system.
 def connect_sheets():
     """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
-    # A. Try Cloud Secrets
+    # First try to load Google credentials from Streamlit Cloud secrets
     try:
         if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
+            
+            # Fix formatting issue in private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+            
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
             client = gspread.authorize(creds)
             return client.open("Content Performance Tracker")
     except Exception:
         pass
 
-    # B. Try Local File
+    # If cloud secrets are not available, try local credentials.json
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
+        # Stop the app if Google credentials are missing
         st.error("❌ Critical Error: No Google Credentials found!")
         st.stop()
         
@@ -57,34 +70,43 @@ def connect_sheets():
     return client.open("Content Performance Tracker")
 
 # ----- CONFIG -----
+
+# Slack webhook URL for notifications
 SLACK_WEBHOOK = get_secret("SLACK_WEBHOOK_URL")
 
-# Input tabs
+# Input sheet tabs where data is already stored
 YOUTUBE_TAB = "YouTube Data"
-REDDIT_TAB = "Reddit Posts" # Updated to match your actual tab name
+REDDIT_TAB = "Reddit Posts"
 REDDIT_COMMENTS_TAB = "Reddit Comments"
 ARTICLES_TAB = "Articles"
 
-# Output tabs
+# Output sheet tabs for results
 ALL_SOURCES_TAB = "All_Content_Sources"
 SENTIMENT_RESULTS_TAB = "Sentiment_Results_All"
 DASHBOARD_TAB = "Performance_Dashboard"
 
+# Thresholds to decide sentiment labels
 POSITIVE_THRESHOLD = 0.05
 NEGATIVE_THRESHOLD = -0.05
 
 # ----- HELPERS -----
+
+# This function sends a short message to Slack
 def send_slack(text):
-    if not SLACK_WEBHOOK: return
+    if not SLACK_WEBHOOK: 
+        return
     try:
         requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10)
     except Exception:
         pass
 
+# This function cleans extra spaces from text
 def normalize_whitespace(s):
-    if not isinstance(s, str): return ""
+    if not isinstance(s, str): 
+        return ""
     return re.sub(r"\s+", " ", s).strip()
 
+# This function safely reads a worksheet and returns a DataFrame
 def safe_get_worksheet(sheet, name):
     try:
         return pd.DataFrame(sheet.worksheet(name).get_all_records())
@@ -92,42 +114,47 @@ def safe_get_worksheet(sheet, name):
         return pd.DataFrame()
 
 # ----- DATA PROCESSING -----
+
+# This function combines data from YouTube, Reddit, and News into one DataFrame
 def build_combined_df(sheet):
     pieces = []
     
-    # YouTube Data
+    # Read YouTube data
     yt = safe_get_worksheet(sheet, YOUTUBE_TAB)
     if not yt.empty:
         for _, r in yt.iterrows():
             text = f"{r.get('Video Title', '')}. {r.get('Description', '')[:300]}"
             pieces.append({
-                "Source": "YouTube", "Content Type": "video",
+                "Source": "YouTube",
+                "Content Type": "video",
                 "Text": normalize_whitespace(text),
                 "URL": f"https://www.youtube.com/watch?v={r.get('Video ID', '')}",
                 "Topic": r.get("Topic", ""),
                 "Date": r.get("Published Date", "")
             })
 
-    # Reddit Posts
+    # Read Reddit post data
     rd = safe_get_worksheet(sheet, REDDIT_TAB)
     if not rd.empty:
         for _, r in rd.iterrows():
             text = f"{r.get('Title', '')}. {r.get('Post Text', '')[:400]}"
             pieces.append({
-                "Source": "Reddit", "Content Type": "post",
+                "Source": "Reddit",
+                "Content Type": "post",
                 "Text": normalize_whitespace(text),
                 "URL": r.get("URL", ""),
                 "Topic": r.get("Subreddit", ""),
                 "Date": r.get("Created Date", "")
             })
 
-    # News Articles
+    # Read News article data
     art = safe_get_worksheet(sheet, ARTICLES_TAB)
     if not art.empty:
         for _, r in art.iterrows():
             text = f"{r.get('Title', '')}. {r.get('Snippet', '')[:300]}"
             pieces.append({
-                "Source": "News", "Content Type": "article",
+                "Source": "News",
+                "Content Type": "article",
                 "Text": normalize_whitespace(text),
                 "URL": r.get("Link", ""),
                 "Topic": r.get("Topic", ""),
@@ -136,23 +163,30 @@ def build_combined_df(sheet):
 
     return pd.DataFrame(pieces)
 
+# This function runs VADER sentiment analysis on text data
 def analyze_sentiment(df):
     sid = SentimentIntensityAnalyzer()
     
+    # Calculate sentiment score for each text
     def get_score(text):
-        if not text or not isinstance(text, str): return 0.0
+        if not text or not isinstance(text, str): 
+            return 0.0
         return sid.polarity_scores(text)['compound']
 
     df['Compound Score'] = df['Text'].apply(get_score)
     
+    # Convert numeric score into Positive / Neutral / Negative
     def get_label(score):
-        if score >= POSITIVE_THRESHOLD: return "Positive"
-        if score <= NEGATIVE_THRESHOLD: return "Negative"
+        if score >= POSITIVE_THRESHOLD: 
+            return "Positive"
+        if score <= NEGATIVE_THRESHOLD: 
+            return "Negative"
         return "Neutral"
         
     df['Sentiment Label'] = df['Compound Score'].apply(get_label)
     return df
 
+# This function uploads a DataFrame to a Google Sheets tab
 def upload_results(sheet, df, tab_name):
     try:
         try:
@@ -166,9 +200,12 @@ def upload_results(sheet, df, tab_name):
         st.error(f"Failed to upload {tab_name}: {e}")
 
 # ----- STREAMLIT UI -----
+
+# App title and description
 st.title("📊 Sentiment Analysis Dashboard")
 st.markdown("Analyze sentiment trends across YouTube, Reddit, and News.")
 
+# Button to start analysis
 if st.button("🚀 Run Analysis", type="primary"):
     with st.spinner("Connecting to Google Sheets..."):
         sheet = connect_sheets()
@@ -184,7 +221,7 @@ if st.button("🚀 Run Analysis", type="primary"):
         with st.spinner("Running VADER Sentiment Analysis..."):
             results_df = analyze_sentiment(combined_df)
             
-        # Display Summary Metrics
+        # Display summary numbers
         col1, col2, col3 = st.columns(3)
         avg_score = results_df['Compound Score'].mean()
         pos_pct = (results_df['Sentiment Label'] == 'Positive').mean() * 100
@@ -194,7 +231,7 @@ if st.button("🚀 Run Analysis", type="primary"):
         col2.metric("Positive Content", f"{pos_pct:.1f}%")
         col3.metric("Negative Content", f"{neg_pct:.1f}%")
         
-        # Display Data Table with Full Columns
+        # Show detailed sentiment results
         st.write("### Detailed Sentiment Report")
         st.dataframe(
             results_df[['Source', 'Content Type', 'Sentiment Label', 'Compound Score', 'Text']],
@@ -205,7 +242,7 @@ if st.button("🚀 Run Analysis", type="primary"):
             hide_index=True
         )
         
-        # Upload Results
+        # Upload results and send Slack notification
         with st.spinner("Uploading results to Google Sheets..."):
             upload_results(sheet, results_df, SENTIMENT_RESULTS_TAB)
             send_slack(f"📊 Sentiment Analysis complete for {len(results_df)} items.")

@@ -9,8 +9,9 @@ from dotenv import load_dotenv
 import re
 from collections import Counter
 
-# This function reads secrets like API keys
-# It first checks Streamlit Cloud, then local .env file
+# ---------------- AUTHENTICATION ----------------
+
+# Gets secrets from Streamlit Cloud or local .env file
 def get_secret(key_name):
     if hasattr(st, "secrets") and key_name in st.secrets:
         return st.secrets[key_name]
@@ -20,15 +21,14 @@ def get_secret(key_name):
     except ImportError:
         return None
 
-# This function connects the app to Google Sheets
-# It works both locally and on Streamlit Cloud
+# Connects to Google Sheets (works locally + on cloud)
 def connect_sheets():
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
 
-    # Try Streamlit Cloud credentials first
+    # Try Streamlit Cloud credentials
     try:
         if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
@@ -50,31 +50,43 @@ def connect_sheets():
 
     return gspread.authorize(creds).open("Content Performance Tracker")
 
-# Google Sheet tab names
+# ---------------- CONFIG ----------------
+
 SENTIMENT_TAB = "Sentiment_Results_All"
 YOUTUBE_TAB = "YouTube Data"
 REDDIT_TAB = "Reddit Posts"
 OUTPUT_TAB = "Content_Insights"
 
-# This safely loads a sheet tab into a DataFrame
+# Common useless words to ignore in insights
+STOPWORDS = {
+    "what", "your", "this", "that", "with", "from", "have",
+    "will", "about", "there", "which", "when", "where", "them"
+}
+
+# ---------------- HELPERS ----------------
+
+# Safely load Google Sheet tab into DataFrame
 def safe_get_df(sheet, tab):
     try:
         return pd.DataFrame(sheet.worksheet(tab).get_all_records())
     except gspread.exceptions.WorksheetNotFound:
         return pd.DataFrame()
 
-# This safely converts columns to numbers
+# Safely convert column to numeric
 def clean_numeric(df, col):
     return pd.to_numeric(df[col], errors="coerce").fillna(0) if col in df.columns else 0
 
-# This extracts most common keywords from text
+# Extract meaningful keywords from text
 def extract_keywords(text_series, top_n=5):
     words = []
     for t in text_series.dropna():
-        words += re.findall(r"\b[a-zA-Z]{4,}\b", t.lower())
+        for w in re.findall(r"\b[a-zA-Z]{4,}\b", t.lower()):
+            if w not in STOPWORDS:
+                words.append(w)
     return [w for w, _ in Counter(words).most_common(top_n)]
 
-# This function calculates all performance metrics
+# ---------------- METRIC LOGIC ----------------
+
 def calculate_metrics():
     sheet = connect_sheets()
 
@@ -90,36 +102,32 @@ def calculate_metrics():
         yt["Likes"] = clean_numeric(yt, "Likes")
         yt["Comments"] = clean_numeric(yt, "Comments")
 
-        # Engagement rate formula
         yt["Engagement"] = ((yt["Likes"] + yt["Comments"]) / yt["Views"].replace(0, 1)) * 100
         metrics["yt_avg_engagement"] = round(yt["Engagement"].mean(), 2)
 
-        # Extract keywords from top video titles
         keywords = extract_keywords(yt["Video Title"])
         metrics["yt_insight"] = (
-            f"High-performing videos often use keywords like: {', '.join(keywords)}"
+            f"Use keywords like {', '.join(keywords)} when generating future marketing content"
         )
     else:
         metrics["yt_avg_engagement"] = 0
         metrics["yt_insight"] = "No YouTube data available"
 
-    # -------- Reddit Metrics (FIXED) --------
+    # -------- Reddit Metrics (Normalized) --------
     if not rd.empty:
         score_col = "Upvotes" if "Upvotes" in rd.columns else "Score"
         rd[score_col] = clean_numeric(rd, score_col)
         rd["Comments"] = clean_numeric(rd, "Comments")
 
-        # Normalized Reddit engagement rate
         rd["Engagement Rate"] = (
             (rd[score_col] + rd["Comments"]) / rd[score_col].replace(0, 1)
         )
 
         metrics["red_avg_engagement"] = round(rd["Engagement Rate"].mean(), 2)
 
-        # Extract common discussion topics
         pain_words = extract_keywords(rd["Title"])
         metrics["red_insight"] = (
-            f"Common discussion themes include: {', '.join(pain_words)}"
+            f"Address audience pain points around: {', '.join(pain_words)}"
         )
     else:
         metrics["red_avg_engagement"] = 0
@@ -134,7 +142,7 @@ def calculate_metrics():
 
     return metrics, sheet
 
-# This uploads insights to Google Sheets
+# Upload insights to Google Sheets
 def upload_insights(sheet, m):
     data = [
         ["Metric", "Value"],
@@ -174,7 +182,12 @@ if st.button("🚀 Generate Insights", type="primary"):
 
     st.divider()
     st.subheader("🧠 Actionable Insights")
+
     st.info(metrics["yt_insight"])
     st.success(metrics["red_insight"])
+
+    st.caption(
+        "These insights are used by the AI content generator to improve relevance, engagement, and campaign performance."
+    )
 
     upload_insights(sheet, metrics)

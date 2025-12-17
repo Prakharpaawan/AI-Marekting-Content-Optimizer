@@ -7,8 +7,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 from dotenv import load_dotenv
 
-# ---------------- AUTHENTICATION ----------------
+# ----- AUTHENTICATION SETUP -----
 
+# This function is used to get secret values like API keys.
+# It first checks Streamlit Cloud secrets.
+# If not found, it loads values from a local .env file.
 def get_secret(key_name):
     """Fetch secret from Streamlit Cloud OR Local .env file"""
     if hasattr(st, "secrets") and key_name in st.secrets:
@@ -19,58 +22,72 @@ def get_secret(key_name):
     except ImportError:
         return None
 
+
+# This function connects the app to Google Sheets.
+# It works both on Streamlit Cloud and on a local system.
 def connect_sheets():
     """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-    
+
+    # First try to load Google credentials from Streamlit Cloud secrets
     try:
         if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
+
+            # Fix formatting issue in private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            return gspread.authorize(creds).open("Content Performance Tracker")
+            client = gspread.authorize(creds)
+            return client.open("Content Performance Tracker")
     except Exception:
         pass
 
+    # If cloud secrets are not available, try local credentials.json
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
-        st.error("❌ Google credentials not found")
+        st.error("❌ Critical Error: No Google Credentials found!")
         st.stop()
 
-    return gspread.authorize(creds).open("Content Performance Tracker")
+    client = gspread.authorize(creds)
+    return client.open("Content Performance Tracker")
 
-# ---------------- CONFIG ----------------
+
+# ----- CONFIG -----
 
 SENTIMENT_TAB = "Sentiment_Results_All"
 YOUTUBE_TAB = "YouTube Data"
 REDDIT_TAB = "Reddit Posts"
 OUTPUT_TAB = "Content_Insights"
 
-# ---------------- HELPERS ----------------
 
-@st.cache_data(show_spinner=False)
+# ----- HELPERS -----
+
 def safe_get_df(sheet, tab_name):
-    """Safely load a worksheet into DataFrame"""
+    """Safely load a worksheet into a Pandas DataFrame."""
     try:
         ws = sheet.worksheet(tab_name)
-        return pd.DataFrame(ws.get_all_records())
-    except Exception:
+        data = ws.get_all_records()
+        return pd.DataFrame(data)
+    except gspread.exceptions.WorksheetNotFound:
         return pd.DataFrame()
 
+
 def clean_numeric(df, col):
-    """Convert column to numeric safely"""
+    """Safely convert a column to numeric, replacing errors with 0."""
     if col in df.columns:
         return pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return pd.Series([0] * len(df))
+    return 0
 
-# ---------------- METRIC CALCULATION ----------------
+
+# ----- CALCULATION LOGIC -----
 
 def calculate_metrics():
     sheet = connect_sheets()
@@ -81,88 +98,98 @@ def calculate_metrics():
 
     metrics = {}
 
-    # ---------- YOUTUBE ----------
+    # --- YOUTUBE METRICS ---
     if not df_yt.empty:
         df_yt["Views"] = clean_numeric(df_yt, "Views")
         df_yt["Likes"] = clean_numeric(df_yt, "Likes")
         df_yt["Comments"] = clean_numeric(df_yt, "Comments")
 
-        df_yt = df_yt[df_yt["Views"] > 0]
-
         df_yt["Engagement"] = (
-            (df_yt["Likes"] + df_yt["Comments"]) / df_yt["Views"]
+            (df_yt["Likes"] + df_yt["Comments"]) /
+            df_yt["Views"].replace(0, 1)
         ) * 100
 
         metrics["yt_avg_engagement"] = round(df_yt["Engagement"].mean(), 2)
 
-        if not df_yt.empty:
-            top = df_yt.sort_values("Views", ascending=False).iloc[0]
-            metrics["yt_top_content"] = f"{top.get('Video Title', 'Unknown')} ({int(top['Views'])} views)"
-        else:
-            metrics["yt_top_content"] = "No Valid Data"
+        top_vid = df_yt.sort_values(by="Views", ascending=False).iloc[0]
+        metrics["yt_top_content"] = (
+            f"{top_vid.get('Video Title', 'Unknown')} "
+            f"({top_vid.get('Views')} views)"
+        )
     else:
         metrics["yt_avg_engagement"] = 0
         metrics["yt_top_content"] = "No Data"
 
-    # ---------- REDDIT ----------
+    # --- REDDIT METRICS ---
     if not df_red.empty:
         upvote_col = "Upvotes" if "Upvotes" in df_red.columns else "Score"
+
         df_red[upvote_col] = clean_numeric(df_red, upvote_col)
         df_red["Comments"] = clean_numeric(df_red, "Comments")
-
-        df_red = df_red[(df_red[upvote_col] > 0)]
 
         df_red["Engagement"] = df_red[upvote_col] + df_red["Comments"]
 
         metrics["red_avg_engagement"] = round(df_red["Engagement"].mean(), 2)
 
-        if not df_red.empty:
-            top = df_red.sort_values(upvote_col, ascending=False).iloc[0]
-            metrics["red_top_content"] = f"{top.get('Title', 'Unknown')} ({int(top[upvote_col])} upvotes)"
-        else:
-            metrics["red_top_content"] = "No Valid Data"
+        top_post = df_red.sort_values(by=upvote_col, ascending=False).iloc[0]
+        metrics["red_top_content"] = (
+            f"{top_post.get('Title', 'Unknown')} "
+            f"({top_post.get(upvote_col)} upvotes)"
+        )
     else:
         metrics["red_avg_engagement"] = 0
         metrics["red_top_content"] = "No Data"
 
-    # ---------- SENTIMENT ----------
+    # --- SENTIMENT METRICS ---
     if not df_sent.empty:
-        score_col = "Compound Score" if "Compound Score" in df_sent.columns else None
-        label_col = "Sentiment Label" if "Sentiment Label" in df_sent.columns else None
+        score_col = (
+            "Compound Score"
+            if "Compound Score" in df_sent.columns
+            else "compound"
+        )
+        label_col = (
+            "Sentiment Label"
+            if "Sentiment Label" in df_sent.columns
+            else "Sentiment_Label"
+        )
 
-        if score_col:
-            df_sent[score_col] = clean_numeric(df_sent, score_col)
-            metrics["avg_sentiment"] = round(df_sent[score_col].mean(), 3)
-        else:
-            metrics["avg_sentiment"] = 0
+        df_sent[score_col] = clean_numeric(df_sent, score_col)
 
-        if label_col:
-            metrics["pos_pct"] = round((df_sent[label_col].str.lower() == "positive").mean() * 100, 1)
-            metrics["neg_pct"] = round((df_sent[label_col].str.lower() == "negative").mean() * 100, 1)
-            metrics["neu_pct"] = round((df_sent[label_col].str.lower() == "neutral").mean() * 100, 1)
+        metrics["avg_sentiment"] = round(df_sent[score_col].mean(), 3)
+
+        if label_col in df_sent.columns:
+            metrics["pos_pct"] = round(
+                (df_sent[label_col].str.lower() == "positive").mean() * 100, 1
+            )
+            metrics["neg_pct"] = round(
+                (df_sent[label_col].str.lower() == "negative").mean() * 100, 1
+            )
+            metrics["neu_pct"] = round(
+                (df_sent[label_col].str.lower() == "neutral").mean() * 100, 1
+            )
         else:
-            metrics["pos_pct"] = metrics["neg_pct"] = metrics["neu_pct"] = 0
+            metrics["pos_pct"] = 0
+            metrics["neg_pct"] = 0
+            metrics["neu_pct"] = 0
 
         metrics["total_items"] = len(df_sent)
     else:
-        metrics.update({
-            "avg_sentiment": 0,
-            "pos_pct": 0,
-            "neg_pct": 0,
-            "neu_pct": 0,
-            "total_items": 0
-        })
+        metrics["avg_sentiment"] = 0
+        metrics["pos_pct"] = 0
+        metrics["neg_pct"] = 0
+        metrics["neu_pct"] = 0
+        metrics["total_items"] = 0
 
     return metrics, sheet
 
-# ---------------- UPLOAD ----------------
 
 def upload_insights(sheet, metrics):
+    """Uploads the summary table to the 'Content_Insights' tab."""
     data = [
         ["Metric", "Value"],
         ["YouTube Avg Engagement %", metrics["yt_avg_engagement"]],
         ["Top YouTube Video", metrics["yt_top_content"]],
-        ["Reddit Avg Engagement", metrics["red_avg_engagement"]],
+        ["Reddit Avg Engagement (Score)", metrics["red_avg_engagement"]],
         ["Top Reddit Post", metrics["red_top_content"]],
         ["Avg Sentiment Score", metrics["avg_sentiment"]],
         ["Positive Sentiment %", f"{metrics['pos_pct']}%"],
@@ -177,40 +204,42 @@ def upload_insights(sheet, metrics):
             ws = sheet.worksheet(OUTPUT_TAB)
             ws.clear()
         except gspread.exceptions.WorksheetNotFound:
-            ws = sheet.add_worksheet(OUTPUT_TAB, rows="50", cols="5")
+            ws = sheet.add_worksheet(title=OUTPUT_TAB, rows="50", cols="5")
 
         ws.update(values=data, range_name="A1")
-        st.toast("✅ Content Insights updated!", icon="🚀")
+        st.toast(f"✅ Updated '{OUTPUT_TAB}' tab in Google Sheets!", icon="🚀")
     except Exception as e:
         st.error(f"Upload failed: {e}")
 
-# ---------------- STREAMLIT UI ----------------
+
+# ----- STREAMLIT UI -----
 
 st.title("📈 Content Performance & Insights")
 st.markdown("Aggregated metrics from YouTube, Reddit, and Sentiment Analysis.")
 
 if st.button("🚀 Generate Performance Report", type="primary"):
-    with st.spinner("Calculating metrics..."):
+    with st.spinner("Calculating metrics across all platforms..."):
         metrics, sheet = calculate_metrics()
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Avg Sentiment", metrics["avg_sentiment"])
-    col2.metric("YouTube Engagement", f"{metrics['yt_avg_engagement']}%")
-    col3.metric("Reddit Engagement", metrics["red_avg_engagement"])
+    if metrics:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Avg Sentiment", metrics["avg_sentiment"])
+        col2.metric("YouTube Engagement", f"{metrics['yt_avg_engagement']}%")
+        col3.metric("Reddit Engagement", metrics["red_avg_engagement"])
 
-    st.divider()
+        st.divider()
 
-    st.subheader("🏆 Top Performing Content")
-    st.info(f"**YouTube:** {metrics['yt_top_content']}")
-    st.success(f"**Reddit:** {metrics['red_top_content']}")
+        st.subheader("🏆 Top Performing Content")
+        st.info(f"**YouTube:** {metrics['yt_top_content']}")
+        st.success(f"**Reddit:** {metrics['red_top_content']}")
 
-    st.divider()
+        st.divider()
 
-    st.subheader("📊 Sentiment Breakdown")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Positive", f"{metrics['pos_pct']}%")
-    c2.metric("Negative", f"{metrics['neg_pct']}%")
-    c3.metric("Neutral", f"{metrics['neu_pct']}%")
+        st.subheader("📊 Sentiment Breakdown")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Positive", f"{metrics['pos_pct']}%")
+        c2.metric("Negative", f"{metrics['neg_pct']}%")
+        c3.metric("Neutral", f"{metrics['neu_pct']}%")
 
-    if sheet:
-        upload_insights(sheet, metrics)
+        if sheet:
+            upload_insights(sheet, metrics)

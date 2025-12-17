@@ -6,14 +6,11 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 from dotenv import load_dotenv
+import re
+from collections import Counter
 
 # ----- AUTHENTICATION SETUP -----
-
-# This function is used to get secret values like API keys.
-# It first checks Streamlit Cloud secrets.
-# If not found, it loads values from a local .env file.
 def get_secret(key_name):
-    """Fetch secret from Streamlit Cloud OR Local .env file"""
     if hasattr(st, "secrets") and key_name in st.secrets:
         return st.secrets[key_name]
     try:
@@ -22,180 +19,110 @@ def get_secret(key_name):
     except ImportError:
         return None
 
-
-# This function connects the app to Google Sheets.
-# It works both on Streamlit Cloud and on a local system.
 def connect_sheets():
-    """Connect to Google Sheets using Cloud Secrets OR Local JSON"""
     scope = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
 
-    # First try to load Google credentials from Streamlit Cloud secrets
     try:
         if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
-
-            # Fix formatting issue in private key
             if "private_key" in creds_dict:
                 creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-
             creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-            client = gspread.authorize(creds)
-            return client.open("Content Performance Tracker")
+            return gspread.authorize(creds).open("Content Performance Tracker")
     except Exception:
         pass
 
-    # If cloud secrets are not available, try local credentials.json
     if os.path.exists("credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
         creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
-        st.error("❌ Critical Error: No Google Credentials found!")
+        st.error("❌ No Google credentials found")
         st.stop()
 
-    client = gspread.authorize(creds)
-    return client.open("Content Performance Tracker")
-
+    return gspread.authorize(creds).open("Content Performance Tracker")
 
 # ----- CONFIG -----
-
 SENTIMENT_TAB = "Sentiment_Results_All"
 YOUTUBE_TAB = "YouTube Data"
 REDDIT_TAB = "Reddit Posts"
 OUTPUT_TAB = "Content_Insights"
 
-
 # ----- HELPERS -----
-
-def safe_get_df(sheet, tab_name):
-    """Safely load a worksheet into a Pandas DataFrame."""
+def safe_get_df(sheet, tab):
     try:
-        ws = sheet.worksheet(tab_name)
-        data = ws.get_all_records()
-        return pd.DataFrame(data)
+        return pd.DataFrame(sheet.worksheet(tab).get_all_records())
     except gspread.exceptions.WorksheetNotFound:
         return pd.DataFrame()
 
-
 def clean_numeric(df, col):
-    """Safely convert a column to numeric, replacing errors with 0."""
-    if col in df.columns:
-        return pd.to_numeric(df[col], errors="coerce").fillna(0)
-    return 0
+    return pd.to_numeric(df[col], errors="coerce").fillna(0) if col in df.columns else 0
 
+def extract_keywords(text_series, top_n=5):
+    words = []
+    for t in text_series.dropna():
+        words += re.findall(r"\b[a-zA-Z]{4,}\b", t.lower())
+    return [w for w, _ in Counter(words).most_common(top_n)]
 
-# ----- CALCULATION LOGIC -----
-
+# ----- METRIC LOGIC -----
 def calculate_metrics():
     sheet = connect_sheets()
-
-    df_sent = safe_get_df(sheet, SENTIMENT_TAB)
-    df_yt = safe_get_df(sheet, YOUTUBE_TAB)
-    df_red = safe_get_df(sheet, REDDIT_TAB)
+    yt = safe_get_df(sheet, YOUTUBE_TAB)
+    rd = safe_get_df(sheet, REDDIT_TAB)
+    sent = safe_get_df(sheet, SENTIMENT_TAB)
 
     metrics = {}
 
-    # --- YOUTUBE METRICS ---
-    if not df_yt.empty:
-        df_yt["Views"] = clean_numeric(df_yt, "Views")
-        df_yt["Likes"] = clean_numeric(df_yt, "Likes")
-        df_yt["Comments"] = clean_numeric(df_yt, "Comments")
+    # ---- YouTube ----
+    if not yt.empty:
+        yt["Views"] = clean_numeric(yt, "Views")
+        yt["Likes"] = clean_numeric(yt, "Likes")
+        yt["Comments"] = clean_numeric(yt, "Comments")
 
-        df_yt["Engagement"] = (
-            (df_yt["Likes"] + df_yt["Comments"]) /
-            df_yt["Views"].replace(0, 1)
-        ) * 100
+        yt["Engagement"] = ((yt["Likes"] + yt["Comments"]) / yt["Views"].replace(0, 1)) * 100
+        metrics["yt_avg_engagement"] = round(yt["Engagement"].mean(), 2)
 
-        metrics["yt_avg_engagement"] = round(df_yt["Engagement"].mean(), 2)
-
-        top_vid = df_yt.sort_values(by="Views", ascending=False).iloc[0]
-        metrics["yt_top_content"] = (
-            f"{top_vid.get('Video Title', 'Unknown')} "
-            f"({top_vid.get('Views')} views)"
-        )
+        keywords = extract_keywords(yt["Video Title"])
+        metrics["yt_insight"] = f"High-performing videos often use keywords like: {', '.join(keywords)}"
     else:
         metrics["yt_avg_engagement"] = 0
-        metrics["yt_top_content"] = "No Data"
+        metrics["yt_insight"] = "No YouTube data available"
 
-    # --- REDDIT METRICS ---
-    if not df_red.empty:
-        upvote_col = "Upvotes" if "Upvotes" in df_red.columns else "Score"
+    # ---- Reddit ----
+    if not rd.empty:
+        score_col = "Upvotes" if "Upvotes" in rd.columns else "Score"
+        rd[score_col] = clean_numeric(rd, score_col)
+        rd["Comments"] = clean_numeric(rd, "Comments")
+        rd["Engagement"] = rd[score_col] + rd["Comments"]
 
-        df_red[upvote_col] = clean_numeric(df_red, upvote_col)
-        df_red["Comments"] = clean_numeric(df_red, "Comments")
+        metrics["red_avg_engagement"] = round(rd["Engagement"].mean(), 2)
 
-        df_red["Engagement"] = df_red[upvote_col] + df_red["Comments"]
-
-        metrics["red_avg_engagement"] = round(df_red["Engagement"].mean(), 2)
-
-        top_post = df_red.sort_values(by=upvote_col, ascending=False).iloc[0]
-        metrics["red_top_content"] = (
-            f"{top_post.get('Title', 'Unknown')} "
-            f"({top_post.get(upvote_col)} upvotes)"
-        )
+        pain_words = extract_keywords(rd["Title"])
+        metrics["red_insight"] = f"Common discussion themes include: {', '.join(pain_words)}"
     else:
         metrics["red_avg_engagement"] = 0
-        metrics["red_top_content"] = "No Data"
+        metrics["red_insight"] = "No Reddit data available"
 
-    # --- SENTIMENT METRICS ---
-    if not df_sent.empty:
-        score_col = (
-            "Compound Score"
-            if "Compound Score" in df_sent.columns
-            else "compound"
-        )
-        label_col = (
-            "Sentiment Label"
-            if "Sentiment Label" in df_sent.columns
-            else "Sentiment_Label"
-        )
-
-        df_sent[score_col] = clean_numeric(df_sent, score_col)
-
-        metrics["avg_sentiment"] = round(df_sent[score_col].mean(), 3)
-
-        if label_col in df_sent.columns:
-            metrics["pos_pct"] = round(
-                (df_sent[label_col].str.lower() == "positive").mean() * 100, 1
-            )
-            metrics["neg_pct"] = round(
-                (df_sent[label_col].str.lower() == "negative").mean() * 100, 1
-            )
-            metrics["neu_pct"] = round(
-                (df_sent[label_col].str.lower() == "neutral").mean() * 100, 1
-            )
-        else:
-            metrics["pos_pct"] = 0
-            metrics["neg_pct"] = 0
-            metrics["neu_pct"] = 0
-
-        metrics["total_items"] = len(df_sent)
+    # ---- Sentiment ----
+    if not sent.empty:
+        sent["Compound Score"] = clean_numeric(sent, "Compound Score")
+        metrics["avg_sentiment"] = round(sent["Compound Score"].mean(), 3)
     else:
         metrics["avg_sentiment"] = 0
-        metrics["pos_pct"] = 0
-        metrics["neg_pct"] = 0
-        metrics["neu_pct"] = 0
-        metrics["total_items"] = 0
 
     return metrics, sheet
 
-
-def upload_insights(sheet, metrics):
-    """Uploads the summary table to the 'Content_Insights' tab."""
+def upload_insights(sheet, m):
     data = [
         ["Metric", "Value"],
-        ["YouTube Avg Engagement %", metrics["yt_avg_engagement"]],
-        ["Top YouTube Video", metrics["yt_top_content"]],
-        ["Reddit Avg Engagement (Score)", metrics["red_avg_engagement"]],
-        ["Top Reddit Post", metrics["red_top_content"]],
-        ["Avg Sentiment Score", metrics["avg_sentiment"]],
-        ["Positive Sentiment %", f"{metrics['pos_pct']}%"],
-        ["Negative Sentiment %", f"{metrics['neg_pct']}%"],
-        ["Neutral Sentiment %", f"{metrics['neu_pct']}%"],
-        ["Total Items Analyzed", metrics["total_items"]],
+        ["YouTube Avg Engagement %", m["yt_avg_engagement"]],
+        ["YouTube Insight", m["yt_insight"]],
+        ["Reddit Avg Engagement", m["red_avg_engagement"]],
+        ["Reddit Insight", m["red_insight"]],
+        ["Avg Sentiment Score", m["avg_sentiment"]],
         ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
     ]
 
@@ -207,39 +134,26 @@ def upload_insights(sheet, metrics):
             ws = sheet.add_worksheet(title=OUTPUT_TAB, rows="50", cols="5")
 
         ws.update(values=data, range_name="A1")
-        st.toast(f"✅ Updated '{OUTPUT_TAB}' tab in Google Sheets!", icon="🚀")
+        st.toast("✅ Content insights updated", icon="🚀")
     except Exception as e:
-        st.error(f"Upload failed: {e}")
-
+        st.error(e)
 
 # ----- STREAMLIT UI -----
-
 st.title("📈 Content Performance & Insights")
-st.markdown("Aggregated metrics from YouTube, Reddit, and Sentiment Analysis.")
+st.markdown("Insights derived from audience behavior to guide content generation.")
 
-if st.button("🚀 Generate Performance Report", type="primary"):
-    with st.spinner("Calculating metrics across all platforms..."):
+if st.button("🚀 Generate Insights", type="primary"):
+    with st.spinner("Analyzing data..."):
         metrics, sheet = calculate_metrics()
 
-    if metrics:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Avg Sentiment", metrics["avg_sentiment"])
-        col2.metric("YouTube Engagement", f"{metrics['yt_avg_engagement']}%")
-        col3.metric("Reddit Engagement", metrics["red_avg_engagement"])
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Avg Sentiment", metrics["avg_sentiment"])
+    col2.metric("YouTube Engagement", f"{metrics['yt_avg_engagement']}%")
+    col3.metric("Reddit Engagement", metrics["red_avg_engagement"])
 
-        st.divider()
+    st.divider()
+    st.subheader("🧠 Actionable Insights")
+    st.info(metrics["yt_insight"])
+    st.success(metrics["red_insight"])
 
-        st.subheader("🏆 Top Performing Content")
-        st.info(f"**YouTube:** {metrics['yt_top_content']}")
-        st.success(f"**Reddit:** {metrics['red_top_content']}")
-
-        st.divider()
-
-        st.subheader("📊 Sentiment Breakdown")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Positive", f"{metrics['pos_pct']}%")
-        c2.metric("Negative", f"{metrics['neg_pct']}%")
-        c3.metric("Neutral", f"{metrics['neu_pct']}%")
-
-        if sheet:
-            upload_insights(sheet, metrics)
+    upload_insights(sheet, metrics)

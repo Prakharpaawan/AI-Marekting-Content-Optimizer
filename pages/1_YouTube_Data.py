@@ -13,7 +13,6 @@ from googleapiclient.discovery import build
 # ----- AUTHENTICATION SETUP -----
 
 def get_secret(key_name):
-    """Fetch secret from Streamlit Cloud OR Local .env file"""
     if hasattr(st, "secrets") and key_name in st.secrets:
         return st.secrets[key_name]
     try:
@@ -25,9 +24,8 @@ def get_secret(key_name):
 
 
 def connect_sheets():
-    """Connect to Google Sheets (Works on Cloud & Local)"""
     scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    
+
     if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
         try:
             creds_dict = json.loads(st.secrets["gcp_credentials"])
@@ -40,19 +38,15 @@ def connect_sheets():
             st.error(f"Secret Error: {e}")
             st.stop()
 
-    local_creds = None
     if os.path.exists("credentials.json"):
-        local_creds = "credentials.json"
+        creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
     elif os.path.exists("../credentials.json"):
-        local_creds = "../credentials.json"
-
-    if local_creds:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(local_creds, scope)
-        client = gspread.authorize(creds)
-        return client.open("Content Performance Tracker")
+        creds = ServiceAccountCredentials.from_json_keyfile_name("../credentials.json", scope)
     else:
         st.error("❌ Critical Error: No Google Credentials found!")
         st.stop()
+
+    return gspread.authorize(creds).open("Content Performance Tracker")
 
 # ----- CONFIG -----
 
@@ -73,6 +67,9 @@ MAX_VIDEOS_PER_TOPIC = 30
 MIN_VIEWS = 10000
 MAX_COMMENTS_PER_VIDEO = 50
 
+# 🔹 NEW: quality threshold
+MIN_COMMENT_LIKES = 5
+
 # ----- HELPERS -----
 
 def clean_text(text):
@@ -81,7 +78,6 @@ def clean_text(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-# 🔹 NEW: English-only filter (small addition)
 def is_english(text, threshold=0.7):
     if not text:
         return False
@@ -97,10 +93,11 @@ def collect_videos_and_comments():
         return pd.DataFrame(), pd.DataFrame()
 
     youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
-    
+
     published_after = (datetime.utcnow() - timedelta(days=PUBLISHED_DAYS)).isoformat("T") + "Z"
     all_videos = []
     all_comments = []
+    seen_comments = set()  # 🔹 NEW
 
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -122,9 +119,11 @@ def collect_videos_and_comments():
 
         for item in search_resp.get("items", []):
             video_id = item["id"]["videoId"]
+
             try:
                 v_resp = youtube.videos().list(
-                    part="statistics,snippet", id=video_id
+                    part="statistics,snippet",
+                    id=video_id
                 ).execute()
             except Exception:
                 continue
@@ -176,10 +175,17 @@ def collect_videos_and_comments():
                         for citem in c_resp["items"]:
                             top = citem["snippet"]["topLevelComment"]["snippet"]
                             comment_text = clean_text(top.get("textDisplay", ""))
+                            like_count = top.get("likeCount", 0)
 
-                            # 🔹 English-only check (only change)
+                            # 🔹 QUALITY FILTERS (only change)
                             if not is_english(comment_text):
                                 continue
+                            if like_count < MIN_COMMENT_LIKES:
+                                continue
+                            if comment_text.lower() in seen_comments:
+                                continue
+
+                            seen_comments.add(comment_text.lower())
 
                             all_comments.append({
                                 "Video ID": video_id,
@@ -187,9 +193,10 @@ def collect_videos_and_comments():
                                 "Comment ID": citem["snippet"]["topLevelComment"]["id"],
                                 "Comment Text": comment_text,
                                 "Author": top.get("authorDisplayName", ""),
-                                "Like Count": top.get("likeCount", 0),
+                                "Like Count": like_count,
                                 "Published At": top.get("publishedAt", ""),
                             })
+
                             count += 1
                             if count >= MAX_COMMENTS_PER_VIDEO:
                                 break
